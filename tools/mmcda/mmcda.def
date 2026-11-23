@@ -1,0 +1,9 @@
+LIBRARY MMCDA
+EXPORTS
+    mciSendCommandA    = _mmcda_mciSendCommandA@16
+    mciGetErrorStringA = _mmcda_mciGetErrorStringA@12
+    timeGetTime        = _mmcda_timeGetTime@0
+    auxGetNumDevs      = _mmcda_auxGetNumDevs@0
+    auxGetDevCapsA     = _mmcda_auxGetDevCapsA@12
+    auxGetVolume       = _mmcda_auxGetVolume@8
+    auxSetVolume       = _mmcda_auxSetVolume@8

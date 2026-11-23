@@ -1,0 +1,68 @@
+# ---- Game and disc content: never commit (you need your own copy) ----
+/game/
+/extracted/
+/install-test/
+/patchtest*/
+/ps1/
+/decomp/
+/MotorMashViewer/
+/MotorMashViewer.zip
+*.bin
+*.cue
+*.ccd
+*.sub
+*.img
+*.iso
+*.chd
+*.pdf
+*.wav
+*.ogg
+*.smk
+*.avi
+
+# derived from the game's code / data
+/tools/sixcars/MotorMsh.dis.txt
+/tools/trackviewer/assets/
+/tools/launcher/music/
+/tools/launcher/payload/
+/tools/launcher/payload.h
+/tools/launcher/payload.rc
+/tools/launcher/payload.res
+
+# ---- build output ----
+*.obj
+*.res
+*.exp
+*.lib
+*.pdb
+*.ilk
+*.log
+_build.bat
+/tools/mmcda/MMCDA.dll
+/tools/mmcda/SDL3.dll
+/tools/launcher/MotorMash.exe
+/tools/patcher/MotorMashPatch.exe
+/tools/patcher/payload.h
+/tools/patcher/patcher.rc
+/tools/vrviewer/*.exe
+/tools/vrviewer/*.dll
+
+# ---- third-party downloads (fetch / unzip locally) ----
+/tools/dgVoodoo2/
+/tools/mmcda/third_party/SDL3/sdl3.zip
+/tools/mmcda/third_party/SDL3/SDL3-3.4.20/lib/x64/
+/tools/mmcda/third_party/SDL3/SDL3-3.4.20/lib/arm64/
+/tools/vrviewer/third_party/openxr/native/
+/tools/venv/
+
+# ---- local scratch ----
+/tools/crash-run*.log
+__pycache__/
+*.pyc
+.claude/
+
+# any built executable, and data dumped from the game
+*.exe
+/tools/trackviewer/tracks.json
+/tools/launcher/motormash.ico
+/tools/gh/

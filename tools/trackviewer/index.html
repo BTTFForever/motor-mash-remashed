@@ -1,0 +1,396 @@
+<title>Motor Mash Track Grids</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&family=Chakra+Petch:wght@500;600&display=swap">
+<style>
+/* Layout: level-editor workspace. Track list on the left, grid canvas centre, inspector + legend right. */
+:root {
+  --bg: #eef1f4; --panel: #ffffff; --ink: #1b2430; --muted: #5d6b7c; --line: #d3dae2;
+  --well: #e3e8ee; --accent: #1f6fd1; --warn: #c27b00; --bad: #c8343b; --gridline: rgba(20,30,45,.18);
+  --font-ui: "IBM Plex Sans", system-ui, sans-serif; --font-data: "IBM Plex Mono", ui-monospace, monospace;
+  --font-display: "Chakra Petch", "IBM Plex Sans", sans-serif;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #12171e; --panel: #1a212b; --ink: #e4e9ef; --muted: #93a1b2; --line: #2b3542;
+  --well: #0d1217; --accent: #5aa2ff; --warn: #f0a52a; --bad: #ff5d64; --gridline: rgba(220,230,245,.14); color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #12171e; --panel: #1a212b; --ink: #e4e9ef; --muted: #93a1b2; --line: #2b3542;
+  --well: #0d1217; --accent: #5aa2ff; --warn: #f0a52a; --bad: #ff5d64; --gridline: rgba(220,230,245,.14); color-scheme: dark }
+html, body { height: 100%; }
+body { background: var(--bg); color: var(--ink); font-family: var(--font-ui); font-size: 14px; margin: 0; }
+.app { display: grid; grid-template-columns: 200px minmax(0,1fr) 300px; gap: 12px; height: 100%;
+  padding-block: 12px; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); box-sizing: border-box; }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+h1 { font-family: var(--font-display); font-size: 17px; font-weight: 600; letter-spacing: .02em; margin: 0; text-wrap: balance; }
+.label { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); font-weight: 600; }
+/* track list */
+.tracks { overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 12px; }
+.world { display: flex; flex-direction: column; gap: 2px; }
+.world button { all: unset; cursor: pointer; padding: 4px 8px; border-radius: 4px; font-family: var(--font-data); font-size: 13px; display: flex; justify-content: space-between; gap: 8px; }
+.world button:hover { background: var(--well); }
+.world button[aria-current="true"] { background: var(--accent); color: #fff; }
+.world button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.world .tag { color: inherit; opacity: .65; font-size: 11px; }
+.trackselect { display: none; }
+/* centre */
+.stage { position: relative; }
+.stagebar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; padding: 10px 12px; border-bottom: 1px solid var(--line); }
+.stats { display: flex; flex-wrap: wrap; gap: 4px 16px; font-family: var(--font-data); font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.stats b { color: var(--ink); font-weight: 500; }
+.layers { display: flex; flex-wrap: wrap; gap: 6px; margin-left: auto; }
+.chip { display: inline-flex; align-items: center; gap: 6px; padding: 3px 9px; border: 1px solid var(--line); border-radius: 999px; font-size: 12px; cursor: pointer; user-select: none; }
+.chip input { margin: 0; accent-color: var(--accent); }
+kbd { font: 500 10px var(--font-data); padding: 0 4px; border: 1px solid var(--line); border-radius: 3px; color: var(--muted); }
+.canvaswrap { position: relative; flex: 1; min-height: 320px; overflow: hidden; background: var(--well); border-radius: 0 0 6px 6px; touch-action: none; }
+canvas { position: absolute; inset: 0; width: 100%; height: 100%; cursor: crosshair; }
+.zoom { position: absolute; right: 10px; bottom: 10px; display: flex; gap: 4px; }
+.zoom button { font: 600 13px var(--font-data); width: 32px; height: 28px; border-radius: 4px; border: 1px solid var(--line); background: var(--panel); color: var(--ink); cursor: pointer; }
+.zoom button:focus-visible { outline: 2px solid var(--accent); }
+/* right */
+.side { overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 16px; }
+.inspect { font-family: var(--font-data); font-size: 12px; display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; font-variant-numeric: tabular-nums; }
+.inspect dt { color: var(--muted); }
+.inspect dd { margin: 0; overflow-wrap: anywhere; }
+.hint { color: var(--muted); font-size: 12px; line-height: 1.5; margin: 0; }
+.pill { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 11px; font-weight: 600; }
+.pill.warn { background: color-mix(in srgb, var(--warn) 20%, transparent); color: var(--warn); }
+.pill.bad { background: color-mix(in srgb, var(--bad) 20%, transparent); color: var(--bad); }
+.pill.acc { background: color-mix(in srgb, var(--accent) 18%, transparent); color: var(--accent); }
+.legend { display: flex; flex-direction: column; gap: 1px; }
+.legend button { all: unset; cursor: pointer; display: grid; grid-template-columns: 14px 1fr auto; align-items: center; gap: 8px; padding: 3px 6px; border-radius: 4px; font-family: var(--font-data); font-size: 12px; }
+.legend button:hover { background: var(--well); }
+.legend button[aria-pressed="true"] { background: color-mix(in srgb, var(--accent) 18%, transparent); }
+.legend button:focus-visible { outline: 2px solid var(--accent); }
+.sw { width: 14px; height: 14px; border-radius: 3px; border: 1px solid rgba(0,0,0,.25); box-sizing: border-box; }
+.legend .n { color: var(--muted); font-variant-numeric: tabular-nums; }
+.anoms { display: flex; flex-direction: column; gap: 4px; font-family: var(--font-data); font-size: 12px; }
+.anoms button { all: unset; cursor: pointer; padding: 2px 6px; border-radius: 4px; }
+.anoms button:hover, .anoms button:focus-visible { background: var(--well); }
+.tabs { display: inline-flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+.tabs button { all: unset; cursor: pointer; padding: 4px 12px; font: 500 12px var(--font-ui); color: var(--muted); }
+.tabs button[aria-selected="true"] { background: var(--accent); color: #fff; }
+.tabs button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+#three { position: absolute; inset: 0; background: #87a8c8; }
+#three canvas { cursor: grab; }
+.overlay { position: absolute; left: 10px; bottom: 10px; padding: 4px 8px; border-radius: 4px; font: 12px var(--font-data);
+  background: rgba(10,15,20,.65); color: #e6edf4; white-space: pre; pointer-events: none; }
+.ctl { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.ctl select, .ctl input[type=number] { font: 13px var(--font-data); padding: 3px 5px; border-radius: 4px; border: 1px solid var(--line); background: var(--panel); color: var(--ink); max-width: 100%; }
+@media (max-width: 1000px) {
+  .app { grid-template-columns: minmax(0,1fr); grid-template-rows: auto minmax(420px, 70vh) auto; height: auto; }
+  .tracklist { display: none; }
+  .trackselect { display: block; font: 500 14px var(--font-data); padding: 6px; border-radius: 4px; border: 1px solid var(--line); background: var(--panel); color: var(--ink); max-width: 100%; }
+}
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+
+<div class="app">
+  <nav class="panel tracklist" aria-label="Tracks">
+    <div class="tracks" id="tracks"></div>
+  </nav>
+
+  <main class="panel stage">
+    <div class="stagebar">
+      <div style="display:flex;flex-direction:column;gap:2px;min-width:0">
+        <h1 id="title">Loading tracks…</h1>
+        <div class="stats" id="stats"></div>
+      </div>
+      <select class="trackselect" id="trackselect" aria-label="Track"></select>
+      <div class="tabs" role="tablist" aria-label="View">
+        <button role="tab" id="v-map" aria-selected="true">Map</button>
+        <button role="tab" id="v-3d" aria-selected="false">3D</button>
+        <button role="tab" id="v-model" aria-selected="false">Models</button>
+      </div>
+      <div class="layers" id="maplayers" role="group" aria-label="Layers">
+        <label class="chip"><input type="checkbox" id="l-tiles" checked>Tiles <kbd>1</kbd></label>
+        <label class="chip"><input type="checkbox" id="l-height" checked>Height <kbd>2</kbd></label>
+        <label class="chip"><input type="checkbox" id="l-rot">Rotation <kbd>3</kbd></label>
+        <label class="chip"><input type="checkbox" id="l-special" checked>Animated <kbd>4</kbd></label>
+        <label class="chip"><input type="checkbox" id="l-anom" checked>Anomalies <kbd>5</kbd></label>
+        <label class="chip"><input type="checkbox" id="l-grid" checked>Grid <kbd>6</kbd></label>
+      </div>
+    </div>
+    <div class="canvaswrap" id="wrap">
+      <canvas id="cv" aria-label="Track tile grid"></canvas>
+      <div class="zoom" id="mapzoom">
+        <button id="zin" title="Zoom in" aria-label="Zoom in">+</button>
+        <button id="zout" title="Zoom out" aria-label="Zoom out">−</button>
+        <button id="zfit" title="Fit to view" aria-label="Fit to view">⤢</button>
+      </div>
+      <div id="three" hidden>
+        <div class="overlay" id="info3d">Loading 3D…</div>
+      </div>
+    </div>
+  </main>
+
+  <aside class="panel side">
+    <section id="ctl3d" hidden>
+      <div class="label" style="margin-bottom:6px">3D</div>
+      <div class="ctl">
+        <label class="chip"><input type="checkbox" id="t-tex" checked>Textures</label>
+        <label class="chip"><input type="checkbox" id="t-wire">Wireframe</label>
+        <label class="chip"><input type="checkbox" id="t-anim" checked>Animate</label>
+        <label class="chip">fps <input type="number" id="t-fps" value="25" min="1" max="60" style="width:46px"></label>
+      </div>
+      <div class="ctl" id="modelpick" hidden style="margin-top:8px">
+        <select id="m-world" aria-label="World"></select>
+        <select id="m-model" aria-label="Model"></select>
+      </div>
+      <p class="hint" style="margin-top:8px">Drag to orbit, right-drag to pan, scroll to zoom. In the Map view, click a cell to fly the 3D camera to it. <kbd>M</kbd> switches Map / 3D.</p>
+    </section>
+    <section id="sec-inspect">
+      <div class="label">Cell</div>
+      <dl class="inspect" id="inspect"></dl>
+      <p class="hint" id="inspecthint">Hover a cell to inspect it. Drag to pan, scroll or use + / − to zoom. Keys: <kbd>[</kbd> <kbd>]</kbd> previous / next track, <kbd>1</kbd>–<kbd>6</kbd> layers, <kbd>F</kbd> fit.</p>
+    </section>
+    <section>
+      <div class="label" style="margin-bottom:6px">Anomalies</div>
+      <div class="anoms" id="anoms"></div>
+    </section>
+    <section>
+      <div class="label" style="margin-bottom:6px">Tiles on this track</div>
+      <div class="legend" id="legend"></div>
+    </section>
+    <p class="hint">Grid decoded from the game's <code>Track\*.MAP</code> files: 16-bit cells holding a tile type (12 bits), a height step (2 bits) and a rotation (2 bits). Tile names come from the per-world mesh tables in MotorMsh.exe. Header values a/b may be a start cell; that is a guess.</p>
+  </aside>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const cv = $('cv'), ctx = cv.getContext('2d'), wrap = $('wrap');
+const ROT = ['0°', '90°', '180°', '270°'];
+let DATA = null, T = null, hover = -1, highlight = null, VIEW = 'map';
+const WORLD_DIRS = ['West', 'Arctic', 'Natlanti', 'Nightmar', 'Amazon', 'City'];
+
+function setView(v, opts = {}) {
+  VIEW = v;
+  for (const [id, name] of [['v-map', 'map'], ['v-3d', '3d'], ['v-model', 'model']]) $(id).setAttribute('aria-selected', String(v === name));
+  const three = v !== 'map';
+  cv.hidden = three; $('mapzoom').hidden = three; $('maplayers').hidden = three;
+  $('three').hidden = !three; $('ctl3d').hidden = !three; $('modelpick').hidden = v !== 'model';
+  $('sec-inspect').hidden = three;
+  if (window.MM3D) {
+    window.MM3D.setActive(three);
+    if (v === '3d' && T) window.MM3D.showTrack(T, opts.focus);
+    if (v === 'model') window.MM3D.showModel();
+  }
+  if (!three) draw();
+  if (T) { const tag = stem(T) + (v === '3d' ? '-3d' : ''); if (location.hash !== '#' + tag) location.replace('#' + tag); }
+}
+$('v-map').onclick = () => setView('map');
+$('v-3d').onclick = () => setView('3d');
+$('v-model').onclick = () => setView('model');
+let view = { s: 20, x: 0, y: 0 };      // cell size in CSS px, top-left offset
+
+function hashHue(s) { let h = 2166136261; for (const c of s) { h ^= c.charCodeAt(0); h = Math.imul(h, 16777619); } return (h >>> 0) % 360; }
+function tileInfo(t, id) { return DATA.tables[t.world].tiles[id] || { name: null, special: false }; }
+function tileColor(t, id) {
+  if (id === t.background) return getComputedStyle(document.documentElement).getPropertyValue('--line').trim();
+  const info = tileInfo(t, id), key = (info.name || ('id' + id));
+  return `hsl(${hashHue(key)} ${info.special ? 70 : 52}% ${info.special ? 52 : 58}%)`;
+}
+function css(v) { return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
+
+function fit() {
+  if (!T) return;
+  const r = wrap.getBoundingClientRect(), pad = 24;
+  view.s = Math.max(4, Math.min((r.width - pad * 2) / T.width, (r.height - pad * 2) / T.height));
+  view.x = (r.width - view.s * T.width) / 2; view.y = (r.height - view.s * T.height) / 2;
+  draw();
+}
+
+function draw() {
+  const r = wrap.getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
+  cv.width = Math.round(r.width * dpr); cv.height = Math.round(r.height * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, r.width, r.height);
+  if (!T) return;
+  const L = id => $(id).checked, s = view.s, bgc = css('--line');
+  for (let row = 0; row < T.height; row++) for (let col = 0; col < T.width; col++) {
+    const i = row * T.width + col, v = T.cells[i], id = v & 0xfff, h = (v >> 12) & 3, rot = (v >> 14) & 3;
+    const x = view.x + col * s, y = view.y + row * s;
+    if (x > r.width || y > r.height || x + s < 0 || y + s < 0) continue;
+    const dim = highlight !== null && id !== highlight;
+    ctx.globalAlpha = dim ? 0.18 : 1;
+    ctx.fillStyle = L('l-tiles') ? tileColor(T, id) : bgc;
+    ctx.fillRect(x, y, s, s);
+    if (L('l-height') && h) { ctx.fillStyle = `rgba(255,255,255,${0.16 * h})`; ctx.fillRect(x, y, s, s);
+      if (s >= 14) { ctx.fillStyle = 'rgba(0,0,0,.55)'; ctx.font = `600 ${Math.min(11, s * .45)}px IBM Plex Mono, monospace`; ctx.fillText(h, x + 2, y + Math.min(11, s * .45) + 1); } }
+    if (L('l-rot') && s >= 8 && id !== T.background) {   // arrow toward the edge the tile faces
+      const c = s / 2, len = s * .32, w = s * .16, a = rot * Math.PI / 2;
+      ctx.save(); ctx.translate(x + c, y + c); ctx.rotate(a);
+      ctx.fillStyle = 'rgba(0,0,0,.6)'; ctx.beginPath();
+      ctx.moveTo(0, -len); ctx.lineTo(w, -len + w * 1.4); ctx.lineTo(w * .35, -len + w * 1.4);
+      ctx.lineTo(w * .35, len * .7); ctx.lineTo(-w * .35, len * .7); ctx.lineTo(-w * .35, -len + w * 1.4);
+      ctx.lineTo(-w, -len + w * 1.4); ctx.closePath(); ctx.fill(); ctx.restore();
+    }
+    if (L('l-special') && tileInfo(T, id).special) {
+      ctx.fillStyle = css('--ink'); ctx.beginPath(); const c = s / 2, d = Math.max(2.5, s * .2);
+      ctx.moveTo(x + c, y + c - d); ctx.lineTo(x + c + d, y + c); ctx.lineTo(x + c, y + c + d); ctx.lineTo(x + c - d, y + c); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+    if (L('l-anom') && T.flags[i]) {
+      ctx.strokeStyle = T.flags[i] & 1 ? css('--bad') : css('--warn'); ctx.lineWidth = Math.max(2, s * .12);
+      ctx.strokeRect(x + ctx.lineWidth / 2, y + ctx.lineWidth / 2, s - ctx.lineWidth, s - ctx.lineWidth);
+    }
+  }
+  if (L('l-grid') && s >= 6) {
+    ctx.strokeStyle = css('--gridline'); ctx.lineWidth = 1; ctx.beginPath();
+    for (let c = 0; c <= T.width; c++) { const x = Math.round(view.x + c * s) + .5; ctx.moveTo(x, view.y); ctx.lineTo(x, view.y + T.height * s); }
+    for (let rr = 0; rr <= T.height; rr++) { const y = Math.round(view.y + rr * s) + .5; ctx.moveTo(view.x, y); ctx.lineTo(view.x + T.width * s, y); }
+    ctx.stroke();
+  }
+  // header a/b cell (possible start)
+  const [a, b] = [T.header[2], T.header[3]];
+  if (a < T.width && b < T.height) {
+    ctx.strokeStyle = css('--accent'); ctx.lineWidth = 2; ctx.setLineDash([4, 3]);
+    ctx.strokeRect(view.x + a * s - 2, view.y + b * s - 2, s + 4, s + 4); ctx.setLineDash([]);
+  }
+  if (hover >= 0) {
+    const hc = hover % T.width, hr = Math.floor(hover / T.width);
+    ctx.strokeStyle = css('--ink'); ctx.lineWidth = 2; ctx.strokeRect(view.x + hc * s + 1, view.y + hr * s + 1, s - 2, s - 2);
+  }
+}
+
+function inspect(i) {
+  const dl = $('inspect');
+  if (i < 0) { dl.innerHTML = ''; $('inspecthint').hidden = false; return; }
+  $('inspecthint').hidden = true;
+  const v = T.cells[i], id = v & 0xfff, info = tileInfo(T, id), col = i % T.width, row = Math.floor(i / T.width);
+  const f = T.flags[i];
+  const rows = [
+    ['row, col', `${row}, ${col}`],
+    ['raw', '0x' + v.toString(16).padStart(4, '0')],
+    ['tile', `${id}${id === T.background ? ' <span class="pill acc">background</span>' : ''}`],
+    ['mesh', info.name || '—'],
+    ['height', (v >> 12) & 3],
+    ['rotation', ROT[(v >> 14) & 3]],
+    ['animated', info.special ? '<span class="pill acc">yes (object pool)</span>' : 'no'],
+  ];
+  if (f & 1) rows.push(['note', '<span class="pill bad">isolated: only background around it</span>']);
+  if (f & 2) rows.push(['note', '<span class="pill warn">height differs from every neighbour</span>']);
+  if (T.header[2] === col && T.header[3] === row) rows.push(['note', '<span class="pill acc">header a/b cell</span>']);
+  dl.innerHTML = rows.map(([k, val]) => `<dt>${k}</dt><dd>${val}</dd>`).join('');
+}
+
+function select(idx) {
+  T = DATA.tracks[idx]; highlight = null; hover = -1;
+  document.querySelectorAll('.world button').forEach(b => b.setAttribute('aria-current', String(+b.dataset.i === idx)));
+  $('trackselect').value = idx;
+  const tbl = DATA.tables[T.world], bgName = tileInfo(T, T.background).name || T.background;
+  const iso = T.flags.filter(f => f & 1).length, hgt = T.flags.filter(f => f & 2).length;
+  const ids = new Map(); T.cells.forEach(v => ids.set(v & 0xfff, (ids.get(v & 0xfff) || 0) + 1));
+  const specials = T.cells.filter(v => tileInfo(T, v & 0xfff).special).length;
+  $('title').textContent = `${T.label} · ${tbl.world}`;
+  $('stats').innerHTML = `<span><b>${T.width}×${T.height}</b> cells</span><span>background <b>${bgName}</b></span>` +
+    `<span><b>${ids.size}</b> tile types</span><span><b>${specials}</b> animated</span>` +
+    `<span>header a/b <b>${T.header[2]},${T.header[3]}</b></span><span>${T.file}</span>`;
+  // anomalies
+  const an = [];
+  T.flags.forEach((f, i) => { if (f) an.push(i); });
+  $('anoms').innerHTML = an.length ? an.map(i => {
+    const f = T.flags[i], c = i % T.width, r = Math.floor(i / T.width), id = T.cells[i] & 0xfff;
+    return `<button data-cell="${i}"><span class="pill ${f & 1 ? 'bad' : 'warn'}">${f & 1 ? 'isolated' : 'height'}</span> r${r} c${c} · ${tileInfo(T, id).name || id}</button>`;
+  }).join('') : '<p class="hint">None on this track.</p>';
+  $('anoms').querySelectorAll('button').forEach(b => {
+    b.onmouseenter = b.onfocus = () => { hover = +b.dataset.cell; inspect(hover); draw(); };
+  });
+  // legend
+  const leg = [...ids.entries()].sort((a, b) => b[1] - a[1]);
+  $('legend').innerHTML = leg.map(([id, n]) => {
+    const info = tileInfo(T, id);
+    return `<button data-id="${id}" aria-pressed="false"><span class="sw" style="background:${tileColor(T, id)}"></span>` +
+      `<span>${info.name || 'tile ' + id}${info.special ? ' ◆' : ''}</span><span class="n">${n}</span></button>`;
+  }).join('');
+  $('legend').querySelectorAll('button').forEach(b => b.onclick = () => {
+    const id = +b.dataset.id; highlight = highlight === id ? null : id;
+    $('legend').querySelectorAll('button').forEach(x => x.setAttribute('aria-pressed', String(+x.dataset.id === highlight)));
+    draw();
+  });
+  inspect(-1); fit();
+  const tag = stem(T) + (VIEW === '3d' ? '-3d' : '');
+  if (location.hash !== '#' + tag) location.replace('#' + tag);   // deep link, no history spam
+  if (VIEW === '3d' && window.MM3D) window.MM3D.showTrack(T);
+  try { localStorage.setItem('mm-track', idx); } catch (e) {}
+}
+const stem = t => t.file.replace(/\.map$/i, '').replace(/[^A-Za-z0-9-]/g, '');
+const hashParts = () => { const h = location.hash.slice(1).toLowerCase(); return h.endsWith('-3d') ? [h.slice(0, -3), '3d'] : [h, 'map']; };
+const byHash = () => { const [name] = hashParts(); return DATA.tracks.findIndex(t => stem(t).toLowerCase() === name); };
+window.addEventListener('hashchange', () => {
+  if (!DATA) return; const i = byHash(), [, v] = hashParts();
+  if (i >= 0 && DATA.tracks[i] !== T) select(i);
+  if (VIEW !== 'model' && v !== VIEW) setView(v);
+});
+document.addEventListener('keydown', e => {
+  if (!DATA || e.target.closest('select') || e.ctrlKey || e.metaKey || e.altKey) return;
+  const order = [...document.querySelectorAll('.world button')].map(b => +b.dataset.i), cur = order.indexOf(DATA.tracks.indexOf(T));
+  if (e.key === ']' || e.key === '[') { select(order[(cur + (e.key === ']' ? 1 : order.length - 1)) % order.length]); e.preventDefault(); }
+  const layer = ['l-tiles', 'l-height', 'l-rot', 'l-special', 'l-anom', 'l-grid'][+e.key - 1];
+  if (layer && VIEW === 'map') { $(layer).checked = !$(layer).checked; draw(); }
+  if ((e.key === 'f' || e.key === 'F') && VIEW === 'map') fit();
+  if (e.key === 'm' || e.key === 'M') setView(VIEW === 'map' ? '3d' : 'map');
+});
+/* hook for scripted screenshots: MOTORMASH_VIEW.select('Ice1'), .fit(), .ready */
+window.MOTORMASH_VIEW = {
+  get ready() { return !!T; },
+  select: name => { const i = DATA.tracks.findIndex(t => stem(t).toLowerCase() === String(name).toLowerCase()); if (i >= 0) select(i); return i >= 0; },
+  fit: () => fit(),
+  tracks: () => DATA ? DATA.tracks.map(stem) : [],
+};
+
+function cellAt(ev) {
+  const r = cv.getBoundingClientRect(), x = ev.clientX - r.left - view.x, y = ev.clientY - r.top - view.y;
+  const c = Math.floor(x / view.s), rr = Math.floor(y / view.s);
+  return (c >= 0 && rr >= 0 && c < T.width && rr < T.height) ? rr * T.width + c : -1;
+}
+let drag = null;
+cv.addEventListener('pointerdown', e => { drag = { x: e.clientX, y: e.clientY, vx: view.x, vy: view.y }; cv.setPointerCapture(e.pointerId); });
+cv.addEventListener('click', e => {             // a click (not a drag) on a cell: fly the 3D view there
+  if (!T || (drag && Math.hypot(e.clientX - drag.x, e.clientY - drag.y) > 4)) return;
+  if (lastDragDist > 4) return;
+  const i = cellAt(e); if (i < 0) return;
+  setView('3d', { focus: [Math.floor(i / T.width), i % T.width] });
+});
+let lastDragDist = 0;
+cv.addEventListener('pointerup', e => { lastDragDist = drag ? Math.hypot(e.clientX - drag.x, e.clientY - drag.y) : 0; });
+cv.addEventListener('pointermove', e => {
+  if (!T) return;
+  if (drag) { view.x = drag.vx + e.clientX - drag.x; view.y = drag.vy + e.clientY - drag.y; draw(); return; }
+  const i = cellAt(e); if (i !== hover) { hover = i; inspect(i); draw(); }
+});
+cv.addEventListener('pointerup', () => drag = null);
+cv.addEventListener('pointerleave', () => { if (!drag) { hover = -1; draw(); } });
+function zoomAt(f, cx, cy) {
+  const ns = Math.max(3, Math.min(120, view.s * f)), k = ns / view.s;
+  view.x = cx - (cx - view.x) * k; view.y = cy - (cy - view.y) * k; view.s = ns; draw();
+}
+cv.addEventListener('wheel', e => { e.preventDefault(); const r = cv.getBoundingClientRect(); zoomAt(e.deltaY < 0 ? 1.15 : 1 / 1.15, e.clientX - r.left, e.clientY - r.top); }, { passive: false });
+$('zin').onclick = () => { const r = cv.getBoundingClientRect(); zoomAt(1.25, r.width / 2, r.height / 2); };
+$('zout').onclick = () => { const r = cv.getBoundingClientRect(); zoomAt(0.8, r.width / 2, r.height / 2); };
+$('zfit').onclick = fit;
+document.querySelectorAll('.layers input').forEach(i => i.onchange = draw);
+window.addEventListener('resize', draw);
+matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => T && select(DATA.tracks.indexOf(T)));
+$('trackselect').onchange = e => select(+e.target.value);
+
+fetch('tracks.json').then(r => r.json()).then(d => {
+  DATA = d;
+  const byWorld = {};
+  d.tracks.forEach((t, i) => (byWorld[t.world] = byWorld[t.world] || []).push([t, i]));
+  const order = [0, 1, 2, 3, 4, 5];
+  $('tracks').innerHTML = order.filter(w => byWorld[w]).map(w =>
+    `<div class="world"><div class="label" style="padding:0 8px 4px">${d.tables[w].world}</div>` +
+    byWorld[w].map(([t, i]) => {
+      const n = t.flags.filter(f => f).length;
+      return `<button data-i="${i}" aria-current="false"><span>${t.label}</span><span class="tag">${n ? n + ' !' : ''}</span></button>`;
+    }).join('') + '</div>').join('');
+  $('trackselect').innerHTML = order.filter(w => byWorld[w]).map(w =>
+    `<optgroup label="${d.tables[w].world}">` + byWorld[w].map(([t, i]) => `<option value="${i}">${t.label}</option>`).join('') + '</optgroup>').join('');
+  document.querySelectorAll('.world button').forEach(b => b.onclick = () => select(+b.dataset.i));
+  let start = d.tracks.findIndex(t => t.file.toLowerCase() === 'ice1.map');
+  try { const s = localStorage.getItem('mm-track'); if (s !== null && d.tracks[+s]) start = +s; } catch (e) {}
+  if (byHash() >= 0) start = byHash();
+  select(Math.max(0, start));
+  if (hashParts()[1] === '3d') setView('3d');
+}).catch(() => { $('title').textContent = 'Could not load tracks.json'; });
+</script>
