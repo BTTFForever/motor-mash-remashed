@@ -50,10 +50,19 @@ static void ts_scan(void)
         snprintf(g_ts_names[t], sizeof g_ts_names[t], "Custom %c", "9ABCDEFG"[(t & 15) - 8]);
         snprintf(path, sizeof path, "%sTrack\\%s.TXT", g_dir, ts_mapname(t));
         if ((f = fopen(path, "r")) != NULL) {
-            if (fgets(line, sizeof line, f)) {
-                size_t n = strcspn(line, "\r\n");
-                line[n] = 0;
-                if (n > 0) snprintf(g_ts_names[t], sizeof g_ts_names[t], "%.30s", line);
+            int first = 1;
+            while (fgets(line, sizeof line, f)) {
+                char *v = line, *eq;
+                line[strcspn(line, "\r\n#")] = 0;
+                while (*v == ' ' || *v == '\t') v++;
+                if (!*v) continue;
+                eq = strchr(v, '=');
+                if (eq && _strnicmp(v, "name", 4) == 0) {
+                    for (v = eq + 1; *v == ' ' || *v == '\t'; v++) {}
+                    if (*v) snprintf(g_ts_names[t], sizeof g_ts_names[t], "%.30s", v);
+                } else if (!eq && first)                     /* older form: the first line is the name */
+                    snprintf(g_ts_names[t], sizeof g_ts_names[t], "%.30s", v);
+                first = 0;
             }
             fclose(f);
         }
@@ -446,6 +455,181 @@ static void ts_paint_number(BYTE *pix, int w, int h, int num)
     log_msg("tracks: painted ball %d", num);
 }
 
+/* ---- scripted features (lifts, traps) for slots 9-16 ----
+ * Each track has a setup routine (table 0x454d98, run at race start) and an update routine
+ * (0x454f38, run every tick); slots 9-16 point at an empty one. Both are made of calls to
+ * shared building blocks (catalogue in TRACKS.md). Custom slots get ts_feat_setup/update:
+ *  - the world's tile-driven features always run: Ice thin ice, Atlantis height-lock list and
+ *    ambience, Night grab traps (tile 0x40), Amazon lifts (tile 0x57) and ambience, City
+ *    lifts (tile 0x0c), launch pads (tile 0x3a) and ambience;
+ *  - placed traps come from Track\<name>.TXT, one per line, "key = column, row[, ...]":
+ *      falling_floor (Amazon), crusher, spring (Ice), snapper, whirlpool = col,row,height
+ *      (Atlantis), swiper (City).
+ * State slots (0x635a80, 512 dwords) and animated-cell entries (0x630a80, 15 usable) are
+ * handed out after the ones the tile-driven features take. */
+enum { TF_FLOOR, TF_CRUSHER, TF_SPRING, TF_SNAPPER, TF_WHIRL, TF_SWIPER, TF_TYPES };
+static const struct { const char *key; int world, nargs, slots, anim; } k_tf[TF_TYPES] = {
+    { "falling_floor", 4, 2, 3, 1 },
+    { "crusher",       1, 2, 8, 1 },
+    { "spring",        1, 2, 7, 1 },
+    { "snapper",       2, 2, 7, 1 },
+    { "whirlpool",     2, 3, 110, 0 },               /* 100 + per-car records of cars 4-5 */
+    { "swiper",        5, 2, 20, 1 },
+};
+typedef struct { int type, a[3], slot, k; } TS_FEAT;
+/* Atlantis depth plan: (gate from, gate to, swim level) triples, 0xff-terminated, read by the AI
+   from a per-track table (0x459f58, moved to g_ts_water). The AI swims up or down to the
+   level of the zone it is in. */
+static DWORD g_ts_water[96];
+static const BYTE k_ts_nodepth[4] = { 0xFF, 0, 0, 0 };
+static BYTE g_ts_depth[3 * 80 + 1];
+static int g_ts_ndepth;
+static TS_FEAT g_tf[24];
+static int g_ntf, g_tf_world;
+#define TS_S(i)  (((volatile int *)0x00635A80)[i])
+#define TS_CALL(a) ((void (__cdecl *)())(a))
+
+static int ts_count_tiles(const int *ids, int n)
+{
+    const unsigned short *map = *(const unsigned short **)0x00465638;
+    int w = G_I32(0x00488000), h = G_I32(0x00465634), i, k, c = 0;
+    if (!map) return 0;
+    for (i = 0; i < w * h; i++)
+        for (k = 0; k < n; k++)
+            if ((map[8 + i] & 0x7F) == ids[k]) { c++; break; }
+    return c;
+}
+
+static void ts_load_features(int t)
+{
+    char path[MAX_PATH], line[128];
+    FILE *f;
+    g_ntf = 0;
+    g_ts_ndepth = 0;
+    snprintf(path, sizeof path, "%sTrack\\%s.TXT", g_dir, ts_mapname(t));
+    if ((f = fopen(path, "r")) == NULL) return;
+    while (fgets(line, sizeof line, f) && g_ntf < (int)(sizeof g_tf / sizeof g_tf[0])) {
+        char *eq, *v = line;
+        int ty, n;
+        line[strcspn(line, "\r\n#")] = 0;
+        while (*v == ' ' || *v == '\t') v++;
+        if (!(eq = strchr(v, '='))) continue;
+        if (_strnicmp(v, "depth", 5) == 0) {
+            int lo, hi, lv;
+            if (sscanf(eq + 1, " %d , %d , %d", &lo, &hi, &lv) == 3 && g_ts_ndepth < 80 && lo >= 0 && hi <= 254 && lv >= 0 && lv <= 3) {
+                g_ts_depth[3 * g_ts_ndepth] = (BYTE)lo; g_ts_depth[3 * g_ts_ndepth + 1] = (BYTE)hi;
+                g_ts_depth[3 * g_ts_ndepth + 2] = (BYTE)lv; g_ts_ndepth++;
+            }
+            continue;
+        }
+        for (ty = 0; ty < TF_TYPES; ty++)
+            if (_strnicmp(v, k_tf[ty].key, strlen(k_tf[ty].key)) == 0) break;
+        if (ty == TF_TYPES) continue;
+        memset(&g_tf[g_ntf], 0, sizeof g_tf[0]);
+        n = sscanf(eq + 1, " %d , %d , %d", &g_tf[g_ntf].a[0], &g_tf[g_ntf].a[1], &g_tf[g_ntf].a[2]);
+        if (k_tf[ty].world != (t >> 4)) { log_msg("tracks: %s: %s is not a feature of this world, skipped", path, k_tf[ty].key); continue; }
+        if (n < k_tf[ty].nargs) { log_msg("tracks: %s: %s needs %d numbers", path, k_tf[ty].key, k_tf[ty].nargs); continue; }
+        g_tf[g_ntf++].type = ty;
+    }
+    fclose(f);
+}
+
+/* No depth lines: follow the tile height under each gate's racing point, changing level 4
+   gates early as the shipped tracks do (the map buffer holds the whole file: header, tiles,
+   racing line, gate grid, then the gates). */
+static void ts_auto_depth(void)
+{
+    const short *map = *(const short **)0x00465638, *g;
+    int w = G_I32(0x00488000), h = G_I32(0x00465634), n, i, lv[256], cur = -1;
+    if (!map || w <= 0 || h <= 0) return;
+    g = map + 8 + w * h + (16 * w * h) / 2 + 16 * w * h;
+    n = (g[0] + 8) / 8;
+    if (n > 0 && g[8 * (n - 1) + 1] == -1) n--;              /* the end record */
+    if (n > 255) n = 255;
+    for (i = 0; i < n; i++) {
+        int cx = g[8 * i + 6] / 8, cy = g[8 * i + 7] / 8;
+        lv[i] = cx >= 0 && cx < w && cy >= 0 && cy < h ? (map[8 + cy * w + cx] >> 12) & 3 : 0;
+    }
+    g_ts_ndepth = 0;
+    for (i = 0; i < n && g_ts_ndepth < 80; i++) {
+        int l = lv[i + 4 < n ? i + 4 : (i + 4) - n];
+        if (l != cur) {
+            g_ts_depth[3 * g_ts_ndepth] = (BYTE)i; g_ts_depth[3 * g_ts_ndepth + 2] = (BYTE)l;
+            if (g_ts_ndepth) g_ts_depth[3 * g_ts_ndepth - 2] = (BYTE)(i - 1);
+            g_ts_ndepth++;
+            cur = l;
+        }
+        g_ts_depth[3 * g_ts_ndepth - 2] = (BYTE)i;
+    }
+}
+
+static void __cdecl ts_feat_setup(void)
+{
+    static const int ice[6] = { 0x35, 0x36, 0x3A, 0x3B, 0x7A, 0x7B }, grab[1] = { 0x40 }, lift_m[1] = { 0x57 },
+                     lift_c[1] = { 0x0C }, pad[1] = { 0x3A };
+    int t = G_I32(0x00634C44), w = t >> 4, slot = 2, k = 0, i;
+    g_tf_world = w;
+    ts_load_features(t);
+    switch (w) {                                         /* the world's tile-driven features */
+    case 1: TS_CALL(0x00416DD0)(100, 1); slot = 100 + 10 * ts_count_tiles(ice, 6); break;
+    case 2: TS_CALL(0x004185C0)();
+            if (!g_ts_ndepth) ts_auto_depth();
+            g_ts_depth[3 * g_ts_ndepth] = 0xFF;
+            if (g_ts_water[t]) g_ts_water[t] = (DWORD)g_ts_depth;
+            log_msg("tracks: %d depth zones", g_ts_ndepth);
+            break;
+    case 3: k = ts_count_tiles(grab, 1); TS_CALL(0x00419D30)(0x006381E0, 0x40); TS_CALL(0x0041A280)(0x006381E0, 10);
+            slot = 10 + 20 * k; break;
+    case 4: TS_CALL(0x00417FA0)(0, 30); slot = 30 + 30 * ts_count_tiles(lift_m, 1); break;
+    case 5: TS_CALL(0x0041B690)(0, 30); TS_CALL(0x0041AC60)(1, (TS_S(0) + 1) * 30);
+            slot = (ts_count_tiles(lift_c, 1) + 1) * 30 + 10 * ts_count_tiles(pad, 1); break;
+    }
+    for (i = 0; i < g_ntf; i++) {                        /* placed traps */
+        TS_FEAT *e = &g_tf[i];
+        const int *a = e->a;
+        if (slot + k_tf[e->type].slots > 512 || (k_tf[e->type].anim && k > 14)) {
+            log_msg("tracks: too many features, %s at %d,%d left out", k_tf[e->type].key, a[0], a[1]);
+            g_ntf = i;
+            break;
+        }
+        e->slot = slot; slot += k_tf[e->type].slots;
+        e->k = k_tf[e->type].anim ? k++ : 0;
+        switch (e->type) {
+        case TF_FLOOR:   TS_CALL(0x00418030)(a[0], a[1], e->k, e->slot); break;
+        case TF_CRUSHER: TS_CALL(0x00416590)(a[0], a[1], e->k, e->slot); break;
+        case TF_SPRING:  TS_CALL(0x00416900)(a[0], a[1], e->k, e->slot); break;
+        case TF_SNAPPER: TS_CALL(0x004186A0)(a[0], a[1], e->k, e->slot); break;
+        case TF_WHIRL:   TS_CALL(0x00418F10)(e->slot); break;
+        case TF_SWIPER:  TS_CALL(0x0041B760)(0, a[0], a[1], e->slot, e->k); break;
+        }
+        log_msg("tracks: %s at %d,%d (state %d, cell anim %d)", k_tf[e->type].key, a[0], a[1], e->slot, e->k);
+    }
+}
+
+static void __cdecl ts_feat_update(void)
+{
+    int w = g_tf_world, i;
+    switch (w) {
+    case 1: TS_CALL(0x00416E70)(100, 1); break;
+    case 2: TS_CALL(0x00419340)(); break;
+    case 3: TS_CALL(0x0041A6C0)(); TS_CALL(0x0041A2E0)(0x006381E0, 10); break;
+    case 4: TS_CALL(0x0041BF90)(); for (i = 0; i < TS_S(0) && i < 16; i++) TS_CALL(0x00417790)(30 * (i + 1)); break;
+    case 5: TS_CALL(0x0041BF90)(); TS_CALL(0x0041B720)(30); TS_CALL(0x0041ACE0)((TS_S(0) + 1) * 30); break;
+    }
+    for (i = 0; i < g_ntf; i++) {
+        TS_FEAT *e = &g_tf[i];
+        const int *a = e->a;
+        switch (e->type) {
+        case TF_FLOOR:   TS_CALL(0x00418070)(a[0], a[1], e->k, e->slot); break;
+        case TF_CRUSHER: TS_CALL(0x00416610)(e->k, e->slot); break;
+        case TF_SPRING:  TS_CALL(0x00416980)(e->k, e->slot); break;
+        case TF_SNAPPER: TS_CALL(0x00418750)(e->k, e->slot); break;
+        case TF_WHIRL:   TS_CALL(0x00418FF0)(a[0], a[2], a[1], e->slot, 0); break;
+        case TF_SWIPER:  TS_CALL(0x0041B950)(e->slot, e->k); break;
+        }
+    }
+}
+
 /* The small ball in the parrot's hand on the mode screen is front-end sprite 0x96 + (slot & 7)
    (0x41101a: and edx,7 / add edx,96h). There is no small ball for slots 9-16, so a custom
    track gets id 0x89, which maps to no sprite (0x4868e0[0x89] = -1): nothing is drawn. */
@@ -549,6 +733,27 @@ static void install_tracks(void)
     /* the page change (0x408348) resets the object state table: 0x201 dwords = 57 objects */
     if (G_I32(0x00408349) == 0x201) *(DWORD *)0x00408349 = 65 * 9;
     else log_msg("tracks: object reset site differs, balls 9-16 may stay on screen");
+    {   /* AI speed zones: 0x421cbf reads a per-track list (gate from, gate to, top speed, ...,
+           -1) from 0x45a240[track], a table of only 88 entries, so City slots 9-16 read the next
+           table's numbers as pointers and crash. Give it 96 entries: custom slots of every
+           world get the empty list the other worlds' slots 9-16 already use (0x45a098). */
+        static DWORD speed[96];
+        int t;
+        if (G_I32(0x00421CC2) == 0x0045A240) {
+            for (t = 0; t < 96; t++) speed[t] = t < 88 && (t & 15) < 8 ? ((DWORD *)0x0045A240)[t] : 0x0045A098;
+            *(DWORD *)0x00421CC2 = (DWORD)speed;
+        } else log_msg("tracks: AI speed table site differs, City custom slots may crash");
+    }
+    {   /* Atlantis (underwater, [0x631a54] = 1): 0x421d13 and 0x422448 read a byte list (gate
+           from, gate to, ..., 0xff) from 0x459f58[track]; only Atlantis 1-8 (tracks 32-39) have
+           entries, so Atlantis slots 9-16 read garbage. Every other track gets an empty list. */
+        int t;
+        if (G_I32(0x00421D16) == 0x00459F58 && G_I32(0x0042244B) == 0x00459F58) {
+            for (t = 0; t < 96; t++) g_ts_water[t] = t >= 32 && t < 40 ? ((DWORD *)0x00459F58)[t] : (DWORD)k_ts_nodepth;
+            *(DWORD *)0x00421D16 = (DWORD)g_ts_water;
+            *(DWORD *)0x0042244B = (DWORD)g_ts_water;
+        } else log_msg("tracks: Atlantis zone table sites differ, Atlantis custom slots may misbehave");
+    }
     {   /* the parrot's small ball: and edx,7 / add edx,96h -> call ts_icon_thunk, 4 x nop */
         static const BYTE ic_expect[9] = { 0x83, 0xE2, 0x07, 0x81, 0xC2, 0x96, 0x00, 0x00, 0x00 };
         BYTE *at = (BYTE *)0x00411021;
@@ -567,6 +772,14 @@ static void install_tracks(void)
             log_msg("tracks: Clock.ini guard failed: time-trial ghosts of custom slots share slots 1-8");
     }
 
+    {   /* lifts and traps for slots 9-16 */
+        int t;
+        for (t = 0; t < 96; t++)
+            if ((t & 15) >= 8) {
+                ((DWORD *)0x00454D98)[t] = (DWORD)ts_feat_setup;
+                ((DWORD *)0x00454F38)[t] = (DWORD)ts_feat_update;
+            }
+    }
     /* 3. the track select page */
     VirtualProtect((BYTE *)0x00450EDC, 4, PAGE_READWRITE, &old);
     *(DWORD *)0x00450EDC = (DWORD)tracksel_page;

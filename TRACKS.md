@@ -8,7 +8,8 @@ in MotorMsh.exe; nothing here contains game data.
 Save the map in `Track\` under a slot 9-16 name of its world: `AMAZON9.MAP`, then
 `AMAZONA.MAP` .. `AMAZONG.MAP` (likewise `WEST`, `ICE`, `ATLAN`, `NIGHT`, `CITY`). On the
 track select page (the parrot) it follows that world's own tracks, on a green ball labelled
-9 or A-G, named "Custom 9" .. "Custom G", or by the first line of `Track\<name>.TXT`.
+9 or A-G, named "Custom 9" .. "Custom G", or by the `name` line of `Track\<name>.TXT`
+(below; a first line without `=` also counts as the name).
 
 To try it out with a shipped track's layout:
 
@@ -44,9 +45,107 @@ How MMCDA does it (tools/mmcda/tracks.h, game-level, so both renderers):
   There are only 8, and adding sprites means growing the front-end sprite tables, so for
   custom slots it shows none (sprite id 0x89, which maps to nothing).
 - **Loading screen.** Shows the world's picture, the track name and the record.
+- **Two per-track tables were too short** for slots 9-16. The game never ran those slots, so
+  this never showed until now:
+  - AI speed zones: 0x421cbf reads `0x45a240[track]` (lists of gate from, gate to, top speed,
+    ending -1). The table has only 88 entries, so City 9-16 crashed. It is now a 96-entry
+    copy, and custom slots get the empty list.
+  - Atlantis depth zones: 0x421d13 and 0x422448 read `0x459f58[track]`. Only Atlantis 1-8
+    have entries, so Atlantis 9-16 read garbage and the AI stalled. It is now a 96-entry
+    copy; custom Atlantis tracks get their own depth plan (see below).
 
-Still to do: scripted lifts and traps do not run in slots 9-16 (copying Amazon 1 there
-leaves its lift shut), and a new map's tiles must belong to its world.
+A new map's tiles must belong to its world.
+
+### The track's .TXT file
+
+`Track\<name>.TXT` is optional. Each line is `key = values`, and `#` starts a comment:
+
+    name = Jungle Run
+    falling_floor = 13, 25
+
+| Key | World | Values | Building blocks |
+|---|---|---|---|
+| `name` | any | the track's name | |
+| `falling_floor` | Amazon | column, row | 0x418030 / 0x418070 |
+| `crusher` | Ice | column, row | 0x416590 / 0x416610 |
+| `spring` | Ice | column, row (the animated cell; any tile 0x14 launches) | 0x416900 / 0x416980 |
+| `snapper` | Atlantis | column, row | 0x4186a0 / 0x418750 |
+| `whirlpool` | Atlantis | column, row, height | 0x418f10 / 0x418ff0 |
+| `swiper` | City | column, row | 0x41b760 / 0x41b950 |
+| `depth` | Atlantis | gate from, gate to, swim level (0-3), one line per zone | |
+
+The placed traps need their own animated tile at that cell (the tile the shipped tracks use
+there). Atlantis tracks without `depth` lines get a plan from the tile height under each
+gate, changing level 4 gates early as the shipped tracks do.
+
+These features run without being listed, because they find their own tiles:
+
+| World | Feature | Tile |
+|---|---|---|
+| Ice | thin ice | 0x35, 0x36, 0x3a, 0x3b, 0x7a, 0x7b |
+| Atlantis | tiles that block changing level (0x4185c0; its scan only covers 30 x 30) | 0x12, 0x5f, 0x2a, 0x2d, 9, 0x6c-0x6e |
+| Night | grab trap | 0x40 |
+| Amazon | lift | 0x57 |
+| City | lift | 0x0c |
+| City | launch pad | 0x3a |
+
+Amazon, Atlantis and City also get their ambient sound.
+
+### How custom features run
+
+Each track has a setup routine (table 0x454d98, run at race start) and an update routine
+(0x454f38, run every tick). Slots 9-16 used to point at an empty one; custom slots now get
+`ts_feat_setup` / `ts_feat_update` (tracks.h). These call the same building blocks the
+shipped tracks call:
+- **State slots** (0x635a80, 512 dwords, cleared at race start) are handed out after the
+  ranges the tile-driven features use: Amazon lifts 30 + 30 each, City lifts and pads,
+  Night traps 10 + 20 each, Ice thin ice 100 + 10 each.
+- **Animated-cell entries** (0x630a80, 15 usable, -1 ends the list) are handed out after
+  the Night traps.
+
+Tested by racing shipped layouts in slot 9 with their own traps listed: Amazon 1 (the lift
+and falling floor work, the AI laps), City 2, Atlantis 1, Ice 1, Night 1 and West 1.
+
+### Feature catalogue (all 48 shipped tracks)
+
+Read from the per-track routines. Coordinates are cells unless marked as world units
+(1 cell = 1016 units).
+
+- **West.**
+  - Train: 0x4156e0 / 0x415780, a table of start cell, row, direction and range. Uses 5
+    objects; a car it hits is knocked out.
+  - Tornado: 0x416220 / 0x416280, given in world units. Lifts and spins cars.
+  - Rolling object: 0x415fe0 / 0x416050.
+  - Tile animation from fixed cell lists: 0x415f40 / 0x415f60, West 1 and 2 only.
+- **Ice.** Thin ice, crusher, spring, and a spray emitter (0x417030 with a 6-object pool,
+  0x416eb0; visual only).
+- **Atlantis.**
+  - Snapper, whirlpool.
+  - Swimming creatures: 0x418d40 / 0x418dc0, objects, visual only.
+  - Walker: 0x418ae0 / 0x418b60, an object that knocks cars out.
+- **Night.**
+  - Grab trap on tile 0x40.
+  - Follower: 0x419a50, an object.
+  - Roaming object: 0x41a330 / 0x41a390, given in world units.
+- **Amazon.**
+  - Lift on tile 0x57, falling floor.
+  - Circling flyer: 0x418300 / 0x418360, an object, visual only.
+- **City.**
+  - Lift on tile 0x0c, launch pad on tile 0x3a, swiper.
+  - Roaming object: 0x41bc10 / 0x41bc70.
+
+The object-based features (train, tornado, roller, spray, creatures, walker, follower,
+roamers, flyer) need 3D models. Those load per track from 0x444168[track * 16 + object],
+and that table is empty for slots 9-16. They are not offered yet.
+
+Car states set by traps (car record +0x3f0):
+- 7: knocked out or spun.
+- 6: held by a tornado or whirlpool.
+- 9: hit by a roaming object.
+- 2: released.
+
+Both lift types queue cars with `& 3`, so with six cars, cars 4 and 5 would move cars 0
+and 1. That happens on the shipped tracks too.
 
 ## The game was built for more tracks than it shipped
 
@@ -158,6 +257,6 @@ Checks:
 ## Still to find out
 
 - The flag bits in the gate type (8, 16, 64).
-- Scripted features (lifts, traps) for slots 9-16: the trap tables point them at an empty
-  routine; a custom track could name a shipped track whose routines it reuses.
+- Object-based features (tornado, train, flyer, roamers ...) for slots 9-16: their models
+  load from a per-track table (0x444168) that is empty for those slots.
 - A small parrot-hand ball and a time-trial ghost for slots 9-16.
