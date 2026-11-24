@@ -36,37 +36,72 @@ as City fails to build its scene (crash at 0x4024de).
 
 ## Map file format
 
-All values little-endian, 16-bit. N = width x height.
+Fully decoded; `tools/trackmap.py` reads and writes it (`check` round-trips all 48 shipped
+maps byte for byte). All values little-endian. N = width x height cells, Q = 4w x 4h
+quarter-tile squares (the grid the AI and the race logic work on).
 
 | Part | Size | Notes |
 |---|---|---|
 | Header | 8 x u16 | width, height, start cell x, start cell y, world (0 West, 1 Ice, 2 Atlantis, 3 Night, 4 Amazon, 5 City), 0, 0, 0 |
 | Tile grid | N x u16 | row-major; bits 0-11 tile id, 12-13 height step, 14-15 rotation (90 degree steps) |
-| Layer A | N x 16 bytes | per-cell flags (start line cells hold 256, 1); read by car physics (0x421000, 0x421a90) |
-| Layer B | N x 32 bytes | per cell a 4 x 4 grid of route gate numbers (-1 = none): which gate each quarter-tile belongs to |
-| Route | variable | u16 byte count, then 16-byte gates: (x1, y1)-(x2, y2) in 1/8 tiles, gate number, two more values (one rises along the track), width. The AI (0x41dab0-0x41f320) steers by these; race positions most likely come from them |
-| Second list | variable | follows the route (pointer 0x635a60), used by 0x426960; not decoded yet |
+| Racing line | Q bytes | per square the direction the AI goes on from there: 1 up, 3 up-right, 5 right, 7 down-right, 9 down, 11 down-left, 13 left, 15 up-left (up = row 0); 0 and 64 = keep going; bit 7 ignored |
+| Gate grid | Q x s16 | the gate crossing each square, -1 = none: the gates rasterised (Bresenham), the first gate winning where two overlap |
+| Gates | 16 bytes each | type, x1, y1, x2, y2 (quarter tiles), number, rx, ry; then an end record (x1 = -1) |
+| Pickups | 8 x 4 bytes | x, y (quarter tiles), number, height step; 0xff = unused |
 
 All shipped maps are 30 x 30 except some Ice maps (45 x 20, 25 x 36), so the size is per map.
-Some maps keep editor leftovers in a corner (Ice6 has the six thin-ice stage tiles in row 0).
+Some maps keep editor leftovers in a corner (Ice6 has the six thin-ice stage tiles in row 0),
+and most end records carry leftover values after the -1.
+
+### Gates, positions and laps
+
+- A gate is a line across the road. They are numbered in driving order from 0, the start line.
+- `type`: the driving direction in the low 3 bits (0 up, 2 right, 4 down, 6 left, odd =
+  diagonal), plus flag bits whose use is not known yet. In the first record this slot
+  holds the list length instead: records x 8 - 8 in 16-bit units, end record included.
+- `(rx / 2, ry / 2)` is the gate's racing point. A car that leaves the track is put back
+  there (0x41e8b0).
+- Each car counts the gates it passes (0x6331a8 + car x 0x460). Positions sort by that
+  count (0x41e660), and laps = count / number of gates.
+
+### How the AI uses the racing line
+
+Each car steers at a look-ahead point (car record +0x70 x, +0x110 z), and drags a queue of
+39 earlier points behind it. The point starts at the car's position: the start cell's
+centre at the start of a race, or a gate's racing point after a respawn. Setup is 0x421000.
+
+Whenever the car catches up (0x421240), the point steps 128 world units in its current
+direction and reads the racing line where it lands (0x421a90). A tile is 1016 world units,
+and the square for world (x, z) is `(x + x/1016*8) / 256`, `-(z + z/1016*8) / 256`, using C
+division. An empty square keeps the old direction. So a line works only if the walk itself
+stays on it all the way round.
+
+A generated line is drawn by doing that walk: from the start cell, through each gate's
+racing point in turn, writing the heading into every empty square the walk reads. Where
+the track crosses itself (90 degrees or more), the square is cleared so both ways keep
+straight on. The walk takes three laps, so the lap closes at the start line.
+
+Checks:
+- In simulation the generated line laps every shipped track.
+- In game, Amazon 3 with a generated line (raced from slot 9): AI about 3.8 gates/s,
+  against 4.3 on the original line, into lap 2.
+- Copying a track whose scripted features matter (Amazon 1's lift) into slot 9 leaves the
+  AI stuck at the door, because slots 9-16 have no trap or feature routines.
 
 ## What an editor has to produce
 
 1. The tile grid, from the world's tile set (names in the tile table; a 3D preview can reuse
-   the tile meshes).
-2. The route: gates across the road along the racing line, in driving order, with the start
-   line at the header's start cell. Could be drawn by hand or generated from the road tiles.
-3. Layer B, by rasterising the gates into the 4 x 4 quarter-tile grid.
-4. Layer A flags (start line, plus whatever else they mark; to be decoded).
-5. The second list (to be decoded).
-
-Layers A and B are not a pure function of the tile (the same tile carries different values
-in different maps), which fits them being route data rather than tile data.
+   the tile meshes). Tiles that need a script (lifts, traps) do nothing in slots 9-16.
+2. The gates: lines across the road in driving order, gate 0 on the start line through the
+   header's start cell, each with a racing point and a direction. These could be drawn by
+   hand or generated from the road tiles.
+3. Everything else is derived: `trackmap.py build` with `"line": null, "gategrid": null`
+   draws the gate grid and the racing line.
+4. Pickups: up to 8 positions; what spawns comes from the exe's per-track table.
 
 ## Still to find out
 
-- Layer A's remaining fields and the second list.
-- Whether the gate values (the "rising" one) need to be continuous, and how laps are counted.
+- The flag bits in the gate type (8, 16, 64).
 - The menu icon and loading screen picture for slots 9-16 (the loading screen shows a 3D
   picture per track).
 - Lap records and unlock state for new slots (saved in the game's own files).
