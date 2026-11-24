@@ -179,10 +179,19 @@ static void install_render_backend(void)
         GetPrivateProfileStringA("render", "filter", "sharp", f, sizeof f, path);
         GetEnvironmentVariableA("MMCDA_FILTER", f, sizeof f);   /* testing */
         g_vr_filter = _stricmp(f, "smooth") == 0;
+        GetPrivateProfileStringA("render", "fog", "off", f, sizeof f, path);
+        GetEnvironmentVariableA("MMCDA_FOG", f, sizeof f);      /* testing */
+        g_fog_on = _stricmp(f, "on") == 0;
     }
-    GetPrivateProfileStringA("render", "backend", "original", v, sizeof v, path);
+    /* Vulkan is the default; the original stays one switch away (Display > Renderer) and is
+       used whenever this PC has no working Vulkan */
+    GetPrivateProfileStringA("render", "backend", "vulkan", v, sizeof v, path);
     GetEnvironmentVariableA("MMCDA_RENDER", v, sizeof v);
     if (_stricmp(v, "vulkan") != 0) { log_msg("render: original (D3DRM + DirectDraw)"); return; }
+    {
+        const char *why = vkp_probe();
+        if (why) { log_msg("render: Vulkan unavailable (%s), using the original renderer", why); return; }
+    }
     /* DDRAW IAT holds DirectDrawEnumerateA and DirectDrawCreate (order checked by value) */
     for (i = 0; i < 2; i++)
         if (dd_iat[i] == (DWORD)ddc) ok = render_patch_iat(&dd_iat[i], ddc, vdd_DirectDrawCreate, "DirectDrawCreate");
@@ -196,7 +205,7 @@ static void install_render_backend(void)
     g_vrm_on_clear = vr_on_clear;
     g_vrm_tex_free = vr_tex_free;
     g_render_vulkan = 1;
-    log_msg("render: vulkan (stage 2: D3DRM scene drawn with Vulkan)");
+    log_msg("render: vulkan");
 }
 
 static void install_render(void)

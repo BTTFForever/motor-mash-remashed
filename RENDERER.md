@@ -151,8 +151,18 @@ Findings that shaped it:
   with the time spent inside Present (the game's own work is ~5 ms).
 - Display menu Cancel restores the Renderer choice with the game's settings word.
 
-**Still to do:** frame pacing in Present (exclusive / independent flip), optional fog as an
-extra, performance.
+**Stage 4 (2026-11-24): default renderer, v1.1.**
+- Pacing: the missed vsyncs were spent waiting for the display to release an image (the
+  compositor). VK_EXT_full_screen_exclusive (application controlled) is used while the window
+  covers its monitor (races); misses dropped from ~9 to ~1-2 per 40 s. `[render] exclusive=off`.
+- Fog extra: `[render] fog=on` sets linear D3DRM scene fog (45-95% of the far clip) in a haze
+  colour per world. Only Vulkan draws it; the software D3DRM device ignores scene fog.
+- Vulkan is the default backend. At start `vkp_probe` checks for a Vulkan 1.1 instance and a
+  GPU with a graphics queue; without one the original renderer is used (`MMCDA_NOVULKAN=1` tests
+  that path).
+
+**Still to do:** performance, in-game VR (phase 2, on hold), native ports (phase 3: Android,
+Quest 3, Linux).
 
 Debug switches (environment variables):
 - `MMCDA_RENDER=original|vulkan`, `MMCDA_FILTER=sharp|smooth`, `MMCDA_TRACK=n` (world*16 + track)

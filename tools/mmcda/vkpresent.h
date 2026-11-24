@@ -15,7 +15,7 @@
     X(vkGetPhysicalDeviceQueueFamilyProperties) X(vkGetPhysicalDeviceMemoryProperties) \
     X(vkCreateDevice) X(vkGetDeviceProcAddr) X(vkDestroySurfaceKHR) X(vkCreateWin32SurfaceKHR) \
     X(vkGetPhysicalDeviceSurfaceSupportKHR) X(vkGetPhysicalDeviceSurfaceCapabilitiesKHR) \
-    X(vkGetPhysicalDeviceSurfaceFormatsKHR) X(vkGetPhysicalDeviceSurfacePresentModesKHR)
+    X(vkGetPhysicalDeviceSurfaceFormatsKHR) X(vkGetPhysicalDeviceSurfacePresentModesKHR)     X(vkEnumerateDeviceExtensionProperties)
 #define VKP_DFUNCS(X) \
     X(vkGetDeviceQueue) X(vkCreateSwapchainKHR) X(vkDestroySwapchainKHR) X(vkGetSwapchainImagesKHR) \
     X(vkAcquireNextImageKHR) X(vkQueuePresentKHR) X(vkQueueSubmit) X(vkDeviceWaitIdle) \
@@ -28,12 +28,19 @@
 
 static PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr;
 static PFN_vkCreateInstance vkCreateInstance;
+static PFN_vkAcquireFullScreenExclusiveModeEXT vkAcquireFullScreenExclusiveModeEXT;
+static PFN_vkReleaseFullScreenExclusiveModeEXT vkReleaseFullScreenExclusiveModeEXT;
 #define X(f) static PFN_##f f;
 VKP_FUNCS(X) VKP_DFUNCS(X)
 #undef X
 
 static struct {
     int ok, failed;
+    double t_fence, t_acquire, t_queue;   /* debug: ms spent waiting in the last present */
+    int fse_ok;                           /* VK_EXT_full_screen_exclusive enabled */
+    int fse_swap;                         /* the swapchain is application-controlled exclusive */
+    int fse_active;                       /* exclusive mode acquired */
+    DWORD fse_try;                        /* last acquire attempt (GetTickCount) */
     HWND wnd;
     VkInstance inst;
     VkPhysicalDevice phys;
@@ -82,6 +89,70 @@ static int vkp_fail(const char *what, VkResult r)
     return 0;
 }
 
+/* Before Vulkan becomes the renderer: is there a Vulkan driver with a GPU that can draw?
+   (Run once at start; no window is needed. Returns a reason on failure.) */
+static const char *vkp_probe(void)
+{
+    HMODULE lib = LoadLibraryA("vulkan-1.dll");
+    PFN_vkGetInstanceProcAddr gipa;
+    PFN_vkCreateInstance ci_;
+    PFN_vkEnumeratePhysicalDevices epd;
+    PFN_vkGetPhysicalDeviceQueueFamilyProperties gqf;
+    PFN_vkDestroyInstance di;
+    VkApplicationInfo app = { VK_STRUCTURE_TYPE_APPLICATION_INFO };
+    VkInstanceCreateInfo ici = { VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
+    const char *iext[] = { VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_WIN32_SURFACE_EXTENSION_NAME };
+    VkInstance inst;
+    VkPhysicalDevice phys[8];
+    uint32_t n = 8, i, q;
+    int found = 0;
+    if (GetEnvironmentVariableA("MMCDA_NOVULKAN", NULL, 0)) return "MMCDA_NOVULKAN set (testing)";
+    if (!lib) return "vulkan-1.dll not found (no Vulkan driver)";
+    gipa = (PFN_vkGetInstanceProcAddr)GetProcAddress(lib, "vkGetInstanceProcAddr");
+    ci_ = gipa ? (PFN_vkCreateInstance)gipa(NULL, "vkCreateInstance") : NULL;
+    if (!ci_) return "vulkan-1.dll has no vkCreateInstance";
+    app.apiVersion = VK_API_VERSION_1_1;
+    ici.pApplicationInfo = &app; ici.enabledExtensionCount = 2; ici.ppEnabledExtensionNames = iext;
+    if (ci_(&ici, NULL, &inst) != VK_SUCCESS) return "cannot create a Vulkan 1.1 instance with window surfaces";
+    epd = (PFN_vkEnumeratePhysicalDevices)gipa(inst, "vkEnumeratePhysicalDevices");
+    gqf = (PFN_vkGetPhysicalDeviceQueueFamilyProperties)gipa(inst, "vkGetPhysicalDeviceQueueFamilyProperties");
+    di = (PFN_vkDestroyInstance)gipa(inst, "vkDestroyInstance");
+    if (epd && gqf && epd(inst, &n, phys) >= 0)
+        for (i = 0; i < n && !found; i++) {
+            VkQueueFamilyProperties qf[16];
+            uint32_t nq = 16;
+            gqf(phys[i], &nq, qf);
+            for (q = 0; q < nq; q++) if (qf[q].queueFlags & VK_QUEUE_GRAPHICS_BIT) found = 1;
+        }
+    if (di) di(inst, NULL);
+    return found ? NULL : "no GPU with a graphics queue";
+}
+
+/* [render] exclusive = on | off (MMCDA_EXCLUSIVE overrides): exclusive fullscreen while the
+   window covers the monitor (races, wide modes) */
+static int vkp_fse_wanted(void)
+{
+    static int w = -1;
+    if (w < 0) {
+        char path[MAX_PATH], v[16];
+        snprintf(path, sizeof path, "%smmcda.ini", g_home);
+        GetPrivateProfileStringA("render", "exclusive", "on", v, sizeof v, path);
+        GetEnvironmentVariableA("MMCDA_EXCLUSIVE", v, sizeof v);
+        w = _stricmp(v, "off") != 0 && strcmp(v, "0") != 0;
+    }
+    return w;
+}
+
+static void vkp_fse_acquire(void)
+{
+    VkResult r;
+    if (GetForegroundWindow() != g_vk.wnd || GetTickCount() - g_vk.fse_try < 1000) return;   /* only while in front */
+    g_vk.fse_try = GetTickCount();
+    r = vkAcquireFullScreenExclusiveModeEXT(g_vk.dev, g_vk.swap);
+    g_vk.fse_active = r == VK_SUCCESS;
+    log_msg("vulkan: exclusive fullscreen %s (%d)", g_vk.fse_active ? "on" : "not granted", (int)r);
+}
+
 static int vkp_make_swapchain(void)
 {
     VkSurfaceCapabilitiesKHR caps;
@@ -109,8 +180,23 @@ static int vkp_make_swapchain(void)
     ci.presentMode = VK_PRESENT_MODE_FIFO_KHR;   /* vsync; the game paces itself */
     ci.clipped = VK_TRUE;
     ci.oldSwapchain = old;
+    {   /* a window that covers its monitor gets exclusive fullscreen (acquired below) */
+        static VkSurfaceFullScreenExclusiveInfoEXT fi = { VK_STRUCTURE_TYPE_SURFACE_FULL_SCREEN_EXCLUSIVE_INFO_EXT };
+        static VkSurfaceFullScreenExclusiveWin32InfoEXT wi = { VK_STRUCTURE_TYPE_SURFACE_FULL_SCREEN_EXCLUSIVE_WIN32_INFO_EXT };
+        HMONITOR mon = MonitorFromWindow(g_vk.wnd, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO mi = { sizeof mi };
+        RECT wr;
+        g_vk.fse_swap = 0; g_vk.fse_active = 0;
+        if (g_vk.fse_ok && vkp_fse_wanted() && GetMonitorInfoA(mon, &mi) && GetWindowRect(g_vk.wnd, &wr) && EqualRect(&wr, &mi.rcMonitor)) {
+            fi.fullScreenExclusive = VK_FULL_SCREEN_EXCLUSIVE_APPLICATION_CONTROLLED_EXT;
+            fi.pNext = &wi; wi.hmonitor = mon;
+            ci.pNext = &fi;
+            g_vk.fse_swap = 1;
+        }
+    }
     if ((r = vkCreateSwapchainKHR(g_vk.dev, &ci, NULL, &g_vk.swap)) != VK_SUCCESS) return vkp_fail("swapchain", r);
     if (old) vkDestroySwapchainKHR(g_vk.dev, old, NULL);
+    if (g_vk.fse_swap) vkp_fse_acquire();
     g_vk.nimg = 8;
     vkGetSwapchainImagesKHR(g_vk.dev, g_vk.swap, &g_vk.nimg, g_vk.img);
     log_msg("vulkan: swapchain %ux%u, %u images", g_vk.extent.width, g_vk.extent.height, g_vk.nimg);
@@ -122,8 +208,9 @@ static int vkp_init(HWND wnd)
     HMODULE lib;
     VkApplicationInfo app = { VK_STRUCTURE_TYPE_APPLICATION_INFO };
     VkInstanceCreateInfo ici = { VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
-    const char *iext[] = { VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_WIN32_SURFACE_EXTENSION_NAME };
-    const char *dext[] = { VK_KHR_SWAPCHAIN_EXTENSION_NAME };
+    const char *iext[3] = { VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_WIN32_SURFACE_EXTENSION_NAME, NULL };
+    int caps2 = 0;
+    const char *dext[2] = { VK_KHR_SWAPCHAIN_EXTENSION_NAME, NULL };
     VkWin32SurfaceCreateInfoKHR sci = { VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR };
     VkPhysicalDevice phys[8];
     uint32_t n = 8, i, q;
@@ -151,7 +238,16 @@ static int vkp_init(HWND wnd)
     app.pEngineName = "MMCDA";
     app.apiVersion = VK_API_VERSION_1_1;
     ici.pApplicationInfo = &app;
-    ici.enabledExtensionCount = 2;
+    {   /* surface capabilities 2: needed for exclusive fullscreen */
+        PFN_vkEnumerateInstanceExtensionProperties enumi =
+            (PFN_vkEnumerateInstanceExtensionProperties)vkGetInstanceProcAddr(NULL, "vkEnumerateInstanceExtensionProperties");
+        VkExtensionProperties ep[128];
+        uint32_t ne = 128, k;
+        if (enumi && enumi(NULL, &ne, ep) >= 0)
+            for (k = 0; k < ne; k++) if (!strcmp(ep[k].extensionName, VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME)) caps2 = 1;
+        if (caps2) iext[2] = VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME;
+    }
+    ici.enabledExtensionCount = caps2 ? 3 : 2;
     ici.ppEnabledExtensionNames = iext;
     if ((r = vkCreateInstance(&ici, NULL, &g_vk.inst)) != VK_SUCCESS) return vkp_fail("instance", r);
 #define X(f) f = (PFN_##f)vkGetInstanceProcAddr(g_vk.inst, #f);
@@ -186,12 +282,25 @@ static int vkp_init(HWND wnd)
     qci.pQueuePriorities = &prio;
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
-    dci.enabledExtensionCount = 1;
+    {   /* exclusive fullscreen: smooth pacing without the desktop compositor in the way */
+        VkExtensionProperties ep[256];
+        uint32_t ne = 256, k;
+        if (caps2 && vkEnumerateDeviceExtensionProperties(g_vk.phys, NULL, &ne, ep) >= 0)
+            for (k = 0; k < ne; k++) if (!strcmp(ep[k].extensionName, VK_EXT_FULL_SCREEN_EXCLUSIVE_EXTENSION_NAME)) g_vk.fse_ok = 1;
+    }
+    dext[1] = VK_EXT_FULL_SCREEN_EXCLUSIVE_EXTENSION_NAME;
+    dci.enabledExtensionCount = g_vk.fse_ok ? 2 : 1;
     dci.ppEnabledExtensionNames = dext;
     if ((r = vkCreateDevice(g_vk.phys, &dci, NULL, &g_vk.dev)) != VK_SUCCESS) return vkp_fail("device", r);
 #define X(f) f = (PFN_##f)vkGetDeviceProcAddr(g_vk.dev, #f);
     VKP_DFUNCS(X)
 #undef X
+    if (g_vk.fse_ok) {
+        vkAcquireFullScreenExclusiveModeEXT = (PFN_vkAcquireFullScreenExclusiveModeEXT)vkGetDeviceProcAddr(g_vk.dev, "vkAcquireFullScreenExclusiveModeEXT");
+        vkReleaseFullScreenExclusiveModeEXT = (PFN_vkReleaseFullScreenExclusiveModeEXT)vkGetDeviceProcAddr(g_vk.dev, "vkReleaseFullScreenExclusiveModeEXT");
+        if (!vkAcquireFullScreenExclusiveModeEXT) g_vk.fse_ok = 0;
+    }
+    log_msg("vulkan: exclusive fullscreen %s", g_vk.fse_ok ? (vkp_fse_wanted() ? "available" : "available, turned off ([render] exclusive)") : "not supported");
     vkGetDeviceQueue(g_vk.dev, g_vk.qfam, 0, &g_vk.queue);
     n = 32;
     vkGetPhysicalDeviceSurfaceFormatsKHR(g_vk.phys, g_vk.surf, &n, fmts);
@@ -313,7 +422,11 @@ static void vkp_present(const BYTE *bits, int w, int h, int pitch, int bpp, cons
         }
     }
     if (!vr_init()) { vr_end_frame(); return; }
-    vkWaitForFences(g_vk.dev, 1, &g_vk.fence, VK_TRUE, UINT64_MAX);
+    {
+        double t0 = now_ms_qpc();
+        vkWaitForFences(g_vk.dev, 1, &g_vk.fence, VK_TRUE, UINT64_MAX);
+        g_vk.t_fence = now_ms_qpc() - t0;
+    }
     if (!vr_overlay(w, h)) { vr_end_frame(); return; }
 
     /* the 2D layer as BGRA; colour 0 (nothing drawn) is transparent */
@@ -349,8 +462,16 @@ static void vkp_present(const BYTE *bits, int w, int h, int pitch, int bpp, cons
     }
     if (under && !vr_underlay(w, h)) under = NULL;
 
-    r = vkAcquireNextImageKHR(g_vk.dev, g_vk.swap, UINT64_MAX, g_vk.acquired, VK_NULL_HANDLE, &idx);
-    if (r == VK_ERROR_OUT_OF_DATE_KHR) { vkDeviceWaitIdle(g_vk.dev); vkp_make_swapchain(); vr_make_targets(); vr_end_frame(); return; }
+    {
+        double t0 = now_ms_qpc();
+        r = vkAcquireNextImageKHR(g_vk.dev, g_vk.swap, UINT64_MAX, g_vk.acquired, VK_NULL_HANDLE, &idx);
+        g_vk.t_acquire = now_ms_qpc() - t0;
+    }
+    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT) {
+        if (r == VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT) { g_vk.fse_active = 0; log_msg("vulkan: exclusive fullscreen lost"); }
+        vkDeviceWaitIdle(g_vk.dev); vkp_make_swapchain(); vr_make_targets(); vr_end_frame(); return;
+    }
+    if (g_vk.fse_swap && !g_vk.fse_active) vkp_fse_acquire();   /* e.g. back after Alt+Tab */
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) { vr_end_frame(); return; }
     vkResetFences(g_vk.dev, 1, &g_vk.fence);
     vkResetCommandBuffer(g_vk.cmd, 0);
@@ -424,7 +545,11 @@ static void vkp_present(const BYTE *bits, int w, int h, int pitch, int bpp, cons
     vkQueueSubmit(g_vk.queue, 1, &si, g_vk.fence);
     pi.waitSemaphoreCount = 1; pi.pWaitSemaphores = &g_vk.done;
     pi.swapchainCount = 1; pi.pSwapchains = &g_vk.swap; pi.pImageIndices = &idx;
-    r = vkQueuePresentKHR(g_vk.queue, &pi);
+    {
+        double t0 = now_ms_qpc();
+        r = vkQueuePresentKHR(g_vk.queue, &pi);
+        g_vk.t_queue = now_ms_qpc() - t0;
+    }
     if (g_vk.shot_pending == 2) {   /* write vkshot.bmp (top-down 32-bit) */
         char path[MAX_PATH];
         FILE *f;
@@ -444,5 +569,8 @@ static void vkp_present(const BYTE *bits, int w, int h, int pitch, int bpp, cons
         g_vk.shot_pending = 0;
     }
     vr_end_frame();
-    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) { vkDeviceWaitIdle(g_vk.dev); vkp_make_swapchain(); vr_make_targets(); }
+    if (r == VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT) { g_vk.fse_active = 0; log_msg("vulkan: exclusive fullscreen lost"); }
+    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR || r == VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT) {
+        vkDeviceWaitIdle(g_vk.dev); vkp_make_swapchain(); vr_make_targets();
+    }
 }

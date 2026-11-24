@@ -63,6 +63,21 @@ Running it again on a patched game updates the patch files and keeps your settin
   frame stays on screen until the new mode is ready.
 - **Higher far clipping** so raised cameras don't cut off the track.
 
+### New Vulkan renderer (default)
+- The game's 3D and 2D now draw through a **new Vulkan renderer** written for this port. It
+  matches the original look (same lighting, colours and back-face culling), runs the
+  interpolated frames at your refresh rate, and uses **exclusive fullscreen** in races for
+  even frame pacing.
+- The **original renderer** (D3DRM through dgVoodoo2) is still there: **Options > Display >
+  Renderer** switches between Original and Vulkan (applies at the next start), like the
+  original game's separate DOS and DirectX versions. A PC without a working Vulkan driver
+  uses the original renderer automatically.
+- Extras (F10 debug menu, or `mmcda.ini`): **smooth texture filtering** (off by default; the
+  original and the PS1 version both draw sharp texels) and **distance fog** per world, which
+  the original game never used.
+- The **race loading screen** (track, lap record, the starter firing his gun) is laid out as
+  in the DOS version and stays on screen for a moment after the shot.
+
 ### Smooth motion at your monitor's refresh rate
 - **Frame interpolation:** the game logic still runs at its original fixed rate, but every
   moving object is blended between ticks, so races render smoothly at 60/120/144 Hz or more.
@@ -155,6 +170,7 @@ saved lap records are not changed, so switching back locks them again. Normally 
 ### Debug menu (F10)
 - Load **any track** (including locked ones) for the next race.
 - Draw distance, an overview camera and other testing helpers.
+- Renderer extras: texture filtering, fog, and showing back faces (to see the models from inside).
 
 ---
 
@@ -176,6 +192,13 @@ scale=4           ; HUD size (or fit)
 anchor=edges      ; edges | center
 [camera]
 zoom=1.3          ; original camera height
+[render]
+backend=vulkan    ; vulkan | original (also Options > Display > Renderer)
+filter=sharp      ; sharp | smooth (Vulkan)
+fog=off           ; on = distance fog (Vulkan)
+exclusive=on      ; off = no exclusive fullscreen in races (Vulkan)
+[display]
+loadscreen=2.5    ; seconds the race loading screen stays after the shot
 ```
 
 Environment variables for testing: `MMCDA_LOG=1` (writes `mmcda.log`), `MMCDA_NOINTERP=1`

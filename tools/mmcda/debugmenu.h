@@ -32,7 +32,7 @@ static const int k_draw_dist[] = { -1, 2, 4, 8, 16, 0 };
 #define N_DRAW_DIST 6
 
 /* ---- items ---------------------------------------------------------------------------- */
-enum { IT_TRACK, IT_CAMERA, IT_ZOOM, IT_HUD, IT_LAYOUT, IT_DIST, IT_SMOOTH, IT_FILTER, IT_BACKFACE, IT_SAVE, IT_COUNT };
+enum { IT_TRACK, IT_CAMERA, IT_ZOOM, IT_HUD, IT_LAYOUT, IT_DIST, IT_SMOOTH, IT_FILTER, IT_FOG, IT_BACKFACE, IT_SAVE, IT_COUNT };
 
 static void track_name(int idx, char *out, size_t n)
 {
@@ -58,6 +58,7 @@ static void item_text(int it, char *out, size_t n)
         break;
     case IT_SMOOTH: snprintf(out, n, "Smooth      %s", g_interp_on ? "On" : "Off"); break;
     case IT_FILTER: snprintf(out, n, "Textures    %s", g_vr_filter ? "Smooth" : "Sharp"); break;
+    case IT_FOG:    snprintf(out, n, "Fog         %s", g_fog_on ? "On" : "Off"); break;
     case IT_BACKFACE: snprintf(out, n, "Back faces  %s", g_vr_backfaces ? "Shown" : "Hidden"); break;
     case IT_SAVE:   snprintf(out, n, "Save settings"); break;
     }
@@ -94,8 +95,9 @@ static void item_change(int it, int dir)
         break;
     case IT_SMOOTH: g_interp_on = !g_interp_on; break;
     case IT_FILTER: g_vr_filter = !g_vr_filter; break;
+    case IT_FOG: g_fog_on = !g_fog_on; break;
     case IT_BACKFACE: g_vr_backfaces = !g_vr_backfaces; log_msg("debug menu: back faces %s", g_vr_backfaces ? "shown" : "hidden"); break;
-    case IT_SAVE: save_zoom(); log_msg("debug menu: settings saved"); break;
+    case IT_SAVE: save_zoom(); save_render_options(); log_msg("debug menu: settings saved"); break;
     }
 }
 

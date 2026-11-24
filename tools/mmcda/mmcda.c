@@ -46,6 +46,7 @@ static double now_ms_qpc(void)
     QueryPerformanceCounter(&c);
     return c.QuadPart * 1000.0 / f.QuadPart;
 }
+static volatile int g_fog_on;          /* extra: distance fog in races ([render] fog), both renderers */
 static volatile int g_vr_filter;      /* 3D textures: 0 sharp (as the original), 1 smooth */
 static volatile int g_vr_backfaces;   /* test mode: draw back faces too (D3DRM culls them) */
 static volatile int g_vr_2d_only;   /* a full-screen 2D page (controller setup): no see-through black */
@@ -299,10 +300,49 @@ typedef HRESULT (WINAPI *PFN_SETPLANE)(void *vp, float l, float r, float b, floa
 static PFN_SETPLANE g_setplane_orig;
 static volatile float g_hscale = 1.0f;
 
+/* Optional fog (the original never turns it on): linear scene fog in a haze colour per world,
+   thickening towards the far clip, so distant scenery fades in instead of popping in. Set
+   through D3DRM's own scene fog; only the Vulkan renderer draws it (the software D3DRM
+   device the original path uses ignores scene fog). The scene background is black (the sky
+   is a model), so each world gets its own colour. */
+static const DWORD k_fog_colour[6] = {
+    0xFFC8AA82,   /* WEST: dust */
+    0xFFC8D7E6,   /* ICE: pale blue-white */
+    0xFF2A5A6E,   /* ATLAN: deep blue-green */
+    0xFF141428,   /* NIGHT: dark navy */
+    0xFF7A9670,   /* AMAZON: green haze */
+    0xFF8C8C96,   /* CITY: grey */
+};
+static float g_zoom;   /* camera zoom (defined below) */
+static void fog_update(void)
+{
+    typedef HRESULT (WINAPI *PFN_B)(void *, BOOL);
+    typedef HRESULT (WINAPI *PFN_C)(void *, DWORD);
+    typedef HRESULT (WINAPI *PFN_M)(void *, int);
+    typedef HRESULT (WINAPI *PFN_P)(void *, float, float, float);
+    static void *last_scene; static int last_on = -1, last_world = -1; static float last_far;
+    int world = (*(volatile int *)0x00634C44) / 16;
+    void *scene = *(void **)0x0054AF08;
+    void **vt;
+    float far_ = g_zoom > 1.0f ? 1024.0f * g_zoom : 1024.0f;
+    if (!scene) return;
+    if (world < 0 || world > 5) world = 4;
+    if (scene == last_scene && g_fog_on == last_on && far_ == last_far && world == last_world) return;
+    last_scene = scene; last_on = g_fog_on; last_far = far_; last_world = world;
+    vt = *(void ***)scene;
+    if (g_fog_on) {
+        ((PFN_C)vt[53])(scene, k_fog_colour[world]);             /* SetSceneFogColor */
+        ((PFN_M)vt[54])(scene, 0);                               /* SetSceneFogMode(D3DRMFOG_LINEAR) */
+        ((PFN_P)vt[55])(scene, far_ * 0.45f, far_ * 0.95f, 1.0f); /* SetSceneFogParams(start, end, density) */
+    }
+    ((PFN_B)vt[52])(scene, g_fog_on ? TRUE : FALSE);              /* SetSceneFogEnable */
+}
+
 static HRESULT WINAPI viewport_setplane_hook(void *vp, float l, float r, float b, float t)
 {
     float s;
     g_in_race_loop = 1;
+    if (!RACE_INTRO) fog_update();
     g_loadscreen_built = 0;   /* the hold is for the next race intro only (not the way out) */
     s = RACE_INTRO ? 1.0f : g_hscale;   /* the intro's backdrop is laid out for 4:3 */
     interp_note_race();
@@ -664,7 +704,15 @@ static void save_zoom(void)
     if (g_hud) snprintf(v, sizeof v, "%d", g_hud); else strcpy(v, "fit");
     WritePrivateProfileStringA("hud", "scale", v, path);
     WritePrivateProfileStringA("hud", "anchor", g_hud_edges ? "edges" : "center", path);
+}
+
+/* F10 "Save settings" only (not the zoom's auto-save, which would also store test overrides) */
+static void save_render_options(void)
+{
+    char path[MAX_PATH];
+    snprintf(path, sizeof path, "%smmcda.ini", g_home);
     WritePrivateProfileStringA("render", "filter", g_vr_filter ? "smooth" : "sharp", path);
+    WritePrivateProfileStringA("render", "fog", g_fog_on ? "on" : "off", path);
 }
 
 static void vr_subclass(HWND wnd);   /* vrexport.h */
@@ -1317,8 +1365,8 @@ static void pacediag(double t_in, double t_out)
     if (!g_race_active || !GetEnvironmentVariableA("MMCDA_PACEDIAG", NULL, 0)) { last_out = 0; return; }
     if (last_out && t_out - last_out > g_present_dt * 1.5 && nlog < 200) {
         nlog++;
-        log_msg("pacediag: %.2f ms frame (%s): work %.2f ms, present %.2f ms", t_out - last_out,
-                g_in_extra ? "in-between" : "tick", t_in - last_out, t_out - t_in);
+        log_msg("pacediag: %.2f ms frame (%s): work %.2f ms, present %.2f ms (fence %.2f, acquire %.2f, queue %.2f)", t_out - last_out,
+                g_in_extra ? "in-between" : "tick", t_in - last_out, t_out - t_in, g_vk.t_fence, g_vk.t_acquire, g_vk.t_queue);
     }
     last_out = t_out;
 }
