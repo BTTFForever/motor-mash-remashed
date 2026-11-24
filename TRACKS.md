@@ -73,10 +73,32 @@ A new map's tiles must belong to its world.
 | `whirlpool` | Atlantis | column, row, height | 0x418f10 / 0x418ff0 |
 | `swiper` | City | column, row | 0x41b760 / 0x41b950 |
 | `depth` | Atlantis | gate from, gate to, swim level (0-3), one line per zone | |
+| `tornado` | West (1) | column, row | 0x416220 / 0x416280, object 9 |
+| `train` | West (2) | start column, row, direction (0 +x, 1 down, 2 -x, 3 up), min, max | 0x4156e0 / 0x415780, objects 4-8 and 11-15 |
+| `roller` | West (1) | column, row | 0x415fe0 / 0x416050, object 10 |
+| `flyer` | Amazon (3) | column, row, height | 0x418300 / 0x418360, objects 4-6 |
+| `fish` | Atlantis (4) | column, row, height | 0x418d40 / 0x418dc0, objects 1-4 |
+| `walker` | Atlantis (1) | column, row, height | 0x418ae0 / 0x418b60, object 0 |
+| `roamer` | Night, City (1) | column, row, height | 0x41a330 / 0x41bc10, object 7 |
+| `spray` | Ice (6) | column, row | 0x417030 / 0x4170b0, a shared pool of objects 4-9 |
+| `follower` | Night | gate from, gate to, one line per range | 0x419a50, object 4 |
+
+Numbers in brackets are how many a track can have.
 
 The placed traps need their own animated tile at that cell (the tile the shipped tracks use
-there). Atlantis tracks without `depth` lines get a plan from the tile height under each
-gate, changing level 4 gates early as the shipped tracks do.
+there). A layout copied from a shipped track needs its traps listed: without them, a
+crusher cell (Ice 1) sits closed across the road.
+
+Atlantis tracks without `depth` lines get a plan from the tile height under each gate,
+changing level 4 gates early as the shipped tracks do. That is a guess: it works for an
+Atlantis 1 layout, but a layout that uses levels 0-2 (Atlantis 2) needs its `depth` lines.
+
+**Models and pickups.** Objects load per track from 0x444168[track * 16 + object]: a model
+id of the world, 0 = none, and only an unbroken run from object 0 is drawn. Pickups use
+0x45b650[track * 9]: the first object, then 4 pickup kinds. Slots 9-16 had neither, so no
+power-ups appeared on custom tracks. They now take their world's slot 1 row and pickups.
+West gets a row with room for two trains, the tornado and the roller. Objects 0-3 are the
+pickups (5-8 in Atlantis).
 
 These features run without being listed, because they find their own tiles:
 
@@ -134,9 +156,14 @@ Read from the per-track routines. Coordinates are cells unless marked as world u
   - Lift on tile 0x0c, launch pad on tile 0x3a, swiper.
   - Roaming object: 0x41bc10 / 0x41bc70.
 
-The object-based features (train, tornado, roller, spray, creatures, walker, follower,
-roamers, flyer) need 3D models. Those load per track from 0x444168[track * 16 + object],
-and that table is empty for slots 9-16. They are not offered yet.
+All of these are offered to custom tracks (table above), apart from West's tile animation
+from fixed cell lists. Tested in slot 9 with shipped layouts:
+- West 1: tornado and two trains moving, pickups visible.
+- Amazon 1: flyer.
+- Night 1: roamer and follower.
+- Atlantis 2: fish and walker.
+- City 1: roamer.
+- Ice 1: spray.
 
 Car states set by traps (car record +0x3f0):
 - 7: knocked out or spun.
@@ -257,6 +284,5 @@ Checks:
 ## Still to find out
 
 - The flag bits in the gate type (8, 16, 64).
-- Object-based features (tornado, train, flyer, roamers ...) for slots 9-16: their models
-  load from a per-track table (0x444168) that is empty for those slots.
+- A better automatic Atlantis depth plan (what decides the level the shipped tracks use).
 - A small parrot-hand ball and a time-trial ghost for slots 9-16.

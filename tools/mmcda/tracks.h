@@ -467,16 +467,30 @@ static void ts_paint_number(BYTE *pix, int w, int h, int num)
  *      (Atlantis), swiper (City).
  * State slots (0x635a80, 512 dwords) and animated-cell entries (0x630a80, 15 usable) are
  * handed out after the ones the tile-driven features take. */
-enum { TF_FLOOR, TF_CRUSHER, TF_SPRING, TF_SNAPPER, TF_WHIRL, TF_SWIPER, TF_TYPES };
-static const struct { const char *key; int world, nargs, slots, anim; } k_tf[TF_TYPES] = {
-    { "falling_floor", 4, 2, 3, 1 },
-    { "crusher",       1, 2, 8, 1 },
-    { "spring",        1, 2, 7, 1 },
-    { "snapper",       2, 2, 7, 1 },
-    { "whirlpool",     2, 3, 110, 0 },               /* 100 + per-car records of cars 4-5 */
-    { "swiper",        5, 2, 20, 1 },
+enum { TF_FLOOR, TF_CRUSHER, TF_SPRING, TF_SNAPPER, TF_WHIRL, TF_SWIPER, TF_TORNADO, TF_TRAIN, TF_ROLLER,
+       TF_FLYER, TF_FISH, TF_WALKER, TF_ROAMER, TF_SPRAY, TF_TYPES };
+/* worlds: bit per world (1 West, 2 Ice, 4 Atlantis, 8 Night, 16 Amazon, 32 City); max: how many
+   a track may have (object features use fixed objects of the custom model row, below) */
+static const struct { const char *key; int worlds, nargs, slots, anim, max; } k_tf[TF_TYPES] = {
+    { "falling_floor", 16, 2, 3, 1, 15 },
+    { "crusher",       2, 2, 8, 1, 15 },
+    { "spring",        2, 2, 7, 1, 15 },
+    { "snapper",       4, 2, 7, 1, 15 },
+    { "whirlpool",     4, 3, 110, 0, 2 },            /* 100 + per-car records of cars 4-5; sound channel 1-2 */
+    { "swiper",        32, 2, 20, 1, 15 },
+    { "tornado",       1, 2, 60, 0, 1 },             /* object 9, sound channel 4 */
+    { "train",         1, 5, 11, 0, 2 },             /* objects 4-8 / 11-15, channels 0-1 / 2-3 */
+    { "roller",        1, 2, 10, 0, 1 },             /* object 10, channel 5 */
+    { "flyer",         16, 3, 4, 0, 3 },             /* objects 4-6 */
+    { "fish",          4, 3, 9, 0, 4 },              /* objects 1-4 */
+    { "walker",        4, 3, 9, 0, 1 },              /* object 0 */
+    { "roamer",        8 | 32, 3, 9, 0, 1 },         /* object 7 */
+    { "spray",         2, 2, 20, 1, 6 },             /* shares a pool of objects 4-9 */
 };
-typedef struct { int type, a[3], slot, k; } TS_FEAT;
+typedef struct { int type, a[6], slot, k, obj; } TS_FEAT;
+/* Night follower: gate ranges (from, to, ..., -1) where an object follows the car */
+static short g_ts_follow[2 * 16 + 1];
+static int g_ts_nfollow, g_ts_spraypool;
 /* Atlantis depth plan: (gate from, gate to, swim level) triples, 0xff-terminated, read by the AI
    from a per-track table (0x459f58, moved to g_ts_water). The AI swims up or down to the
    level of the zone it is in. */
@@ -485,7 +499,7 @@ static const BYTE k_ts_nodepth[4] = { 0xFF, 0, 0, 0 };
 static BYTE g_ts_depth[3 * 80 + 1];
 static int g_ts_ndepth;
 static TS_FEAT g_tf[24];
-static int g_ntf, g_tf_world;
+static int g_ntf, g_tf_world, g_tf_slot_follow;
 #define TS_S(i)  (((volatile int *)0x00635A80)[i])
 #define TS_CALL(a) ((void (__cdecl *)())(a))
 
@@ -506,6 +520,7 @@ static void ts_load_features(int t)
     FILE *f;
     g_ntf = 0;
     g_ts_ndepth = 0;
+    g_ts_nfollow = 0;
     snprintf(path, sizeof path, "%sTrack\\%s.TXT", g_dir, ts_mapname(t));
     if ((f = fopen(path, "r")) == NULL) return;
     while (fgets(line, sizeof line, f) && g_ntf < (int)(sizeof g_tf / sizeof g_tf[0])) {
@@ -514,6 +529,13 @@ static void ts_load_features(int t)
         line[strcspn(line, "\r\n#")] = 0;
         while (*v == ' ' || *v == '\t') v++;
         if (!(eq = strchr(v, '='))) continue;
+        if (_strnicmp(v, "follower", 8) == 0) {
+            int lo, hi;
+            if (sscanf(eq + 1, " %d , %d", &lo, &hi) == 2 && g_ts_nfollow < 16) {
+                g_ts_follow[2 * g_ts_nfollow] = (short)lo; g_ts_follow[2 * g_ts_nfollow + 1] = (short)hi; g_ts_nfollow++;
+            }
+            continue;
+        }
         if (_strnicmp(v, "depth", 5) == 0) {
             int lo, hi, lv;
             if (sscanf(eq + 1, " %d , %d , %d", &lo, &hi, &lv) == 3 && g_ts_ndepth < 80 && lo >= 0 && hi <= 254 && lv >= 0 && lv <= 3) {
@@ -526,8 +548,14 @@ static void ts_load_features(int t)
             if (_strnicmp(v, k_tf[ty].key, strlen(k_tf[ty].key)) == 0) break;
         if (ty == TF_TYPES) continue;
         memset(&g_tf[g_ntf], 0, sizeof g_tf[0]);
-        n = sscanf(eq + 1, " %d , %d , %d", &g_tf[g_ntf].a[0], &g_tf[g_ntf].a[1], &g_tf[g_ntf].a[2]);
-        if (k_tf[ty].world != (t >> 4)) { log_msg("tracks: %s: %s is not a feature of this world, skipped", path, k_tf[ty].key); continue; }
+        {
+            int *a = g_tf[g_ntf].a, used = 0, j;
+            n = sscanf(eq + 1, " %d , %d , %d , %d , %d", &a[0], &a[1], &a[2], &a[3], &a[4]);
+            for (j = 0; j < g_ntf; j++) used += g_tf[j].type == ty;
+            if (used >= k_tf[ty].max) { log_msg("tracks: %s: at most %d %s", path, k_tf[ty].max, k_tf[ty].key); continue; }
+            g_tf[g_ntf].obj = used;                      /* nth of its kind */
+        }
+        if (!(k_tf[ty].worlds & (1 << (t >> 4)))) { log_msg("tracks: %s: %s is not a feature of this world, skipped", path, k_tf[ty].key); continue; }
         if (n < k_tf[ty].nargs) { log_msg("tracks: %s: %s needs %d numbers", path, k_tf[ty].key, k_tf[ty].nargs); continue; }
         g_tf[g_ntf++].type = ty;
     }
@@ -569,6 +597,7 @@ static void __cdecl ts_feat_setup(void)
                      lift_c[1] = { 0x0C }, pad[1] = { 0x3A };
     int t = G_I32(0x00634C44), w = t >> 4, slot = 2, k = 0, i;
     g_tf_world = w;
+    g_ts_spraypool = 0;
     ts_load_features(t);
     switch (w) {                                         /* the world's tile-driven features */
     case 1: TS_CALL(0x00416DD0)(100, 1); slot = 100 + 10 * ts_count_tiles(ice, 6); break;
@@ -601,9 +630,34 @@ static void __cdecl ts_feat_setup(void)
         case TF_SNAPPER: TS_CALL(0x004186A0)(a[0], a[1], e->k, e->slot); break;
         case TF_WHIRL:   TS_CALL(0x00418F10)(e->slot); break;
         case TF_SWIPER:  TS_CALL(0x0041B760)(0, a[0], a[1], e->slot, e->k); break;
+        case TF_TORNADO: TS_CALL(0x00416220)(e->slot, 9, a[0] * 0x3F8 + 0x1FC, -0x200, -(a[1] * 0x3F8 + 0x1FC), 0); break;
+        case TF_TRAIN: {   /* start column, row, direction (0 +x, 1 down, 2 -x, 3 up), min, max */
+            int tbl[6];
+            tbl[0] = a[0]; tbl[1] = 0; tbl[2] = a[1]; tbl[3] = a[2] & 3; tbl[4] = a[3]; tbl[5] = a[4];
+            TS_CALL(0x004156E0)(e->slot, tbl);
+            e->obj = e->obj ? 11 : 4;
+            break;
+        }
+        case TF_ROLLER:  TS_CALL(0x00415FE0)(e->slot, 10, a[0] * 0x3F8 + 0x1FC, -0x100, -(a[1] * 0x3F8 + 0x1FC)); break;
+        case TF_FLYER:   e->obj += 4; TS_CALL(0x00418300)(e->slot, e->obj, a[0], a[1], a[2]); break;
+        case TF_FISH:    e->obj += 1; TS_CALL(0x00418D40)(a[0], a[1], a[2], e->obj, e->slot); break;
+        case TF_WALKER:  TS_CALL(0x00418AE0)(a[0], a[1], a[2], 0, e->slot); break;
+        case TF_ROAMER:
+            if (w == 3) TS_CALL(0x0041A330)(e->slot, 7, a[0] * 0x3F8 + 0x1FC, -(a[1] * 0x3F8 + 0x1FC), a[2]);
+            else TS_CALL(0x0041BC10)(e->slot, 7, a[0] * 0x3F8 + 0x1FC, -(a[1] * 0x3F8 + 0x1FC), a[2]);
+            break;
+        case TF_SPRAY:
+            if (!g_ts_spraypool) {                       /* one pool of 6 spray objects (4-9) */
+                if (slot + 0x2A > 512) break;
+                g_ts_spraypool = slot; slot += 0x2A;
+                TS_CALL(0x00416EB0)(4, g_ts_spraypool);
+            }
+            TS_CALL(0x00417030)(a[0], a[1], e->k, e->slot);
+            break;
         }
         log_msg("tracks: %s at %d,%d (state %d, cell anim %d)", k_tf[e->type].key, a[0], a[1], e->slot, e->k);
     }
+    g_tf_slot_follow = slot;                             /* the Night follower: 9 dwords */
 }
 
 static void __cdecl ts_feat_update(void)
@@ -624,9 +678,22 @@ static void __cdecl ts_feat_update(void)
         case TF_CRUSHER: TS_CALL(0x00416610)(e->k, e->slot); break;
         case TF_SPRING:  TS_CALL(0x00416980)(e->k, e->slot); break;
         case TF_SNAPPER: TS_CALL(0x00418750)(e->k, e->slot); break;
-        case TF_WHIRL:   TS_CALL(0x00418FF0)(a[0], a[2], a[1], e->slot, 0); break;
+        case TF_WHIRL:   TS_CALL(0x00418FF0)(a[0], a[2], a[1], e->slot, e->obj); break;
         case TF_SWIPER:  TS_CALL(0x0041B950)(e->slot, e->k); break;
+        case TF_TORNADO: TS_CALL(0x00416280)(e->slot, 9); break;
+        case TF_TRAIN:   TS_CALL(0x00415780)(e->slot, e->obj, e->obj == 4 ? 0 : 1); break;
+        case TF_ROLLER:  TS_CALL(0x00416050)(e->slot, 10); break;
+        case TF_FLYER:   TS_CALL(0x00418360)(e->slot, e->obj); break;
+        case TF_FISH:    TS_CALL(0x00418DC0)(e->obj, e->slot); break;
+        case TF_WALKER:  TS_CALL(0x00418B60)(0, e->slot); break;
+        case TF_ROAMER:  TS_CALL(w == 3 ? 0x0041A390 : 0x0041BC70)(e->slot, 7); break;
+        case TF_SPRAY:   if (g_ts_spraypool) TS_CALL(0x004170B0)(e->k, e->slot, g_ts_spraypool); break;
         }
+    }
+    if (g_ts_spraypool) TS_CALL(0x00416F90)(4, g_ts_spraypool);
+    if (w == 3 && g_ts_nfollow) {
+        g_ts_follow[2 * g_ts_nfollow] = -1;
+        TS_CALL(0x00419A50)(g_tf_slot_follow, 4, g_ts_follow);
     }
 }
 
@@ -772,6 +839,21 @@ static void install_tracks(void)
             log_msg("tracks: Clock.ini guard failed: time-trial ghosts of custom slots share slots 1-8");
     }
 
+    {   /* 3D objects and pickups for slots 9-16. Per-track object models load from
+           0x444168[track * 16 + object] (a model id of the world, 0 = none; only an unbroken
+           run from object 0 is drawn) and pickups from 0x45b650[track * 9] (first object,
+           then 4 pickup kinds). Slots 9-16 had neither, so no power-ups appeared. They take
+           their world's slot 1 row; West gets one with room for two trains (4-8, 11-15), the
+           tornado (9) and the roller (10). Objects 0-3 are the pickups (5-8 in Atlantis). */
+        static const int west[16] = { 133, 133, 133, 133, 128, 130, 129, 129, 129, 131, 132, 128, 130, 129, 129, 129 };
+        int t, i;
+        for (t = 0; t < 96; t++)
+            if ((t & 15) >= 8) {
+                for (i = 0; i < 16; i++)
+                    ((int *)0x00444168)[t * 16 + i] = (t >> 4) == 0 ? west[i] : ((int *)0x00444168)[(t & 0xF0) * 16 + i];
+                memcpy((BYTE *)0x0045B650 + t * 9, (BYTE *)0x0045B650 + (t & 0xF0) * 9, 9);
+            }
+    }
     {   /* lifts and traps for slots 9-16 */
         int t;
         for (t = 0; t < 96; t++)
