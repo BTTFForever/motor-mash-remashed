@@ -79,8 +79,9 @@ def world_square(x, z):
 
 
 def start_point(start):
-    """Where a car's look-ahead point starts: the start cell's centre."""
-    return start[0] * TILE + TILE // 2, -(start[1] * TILE + TILE // 2)
+    """Where every car's look-ahead point starts at the start of a race: the start cell's
+    corner + 512 (0x420700), which can fall in the square next to the centre one."""
+    return start[0] * TILE + 512, -(start[1] * TILE + 512)
 
 
 def follow_line(line, W, H, start, steps):
@@ -116,7 +117,7 @@ def lap_progress(m, seen):
     return passed
 
 
-def trace_line(W, H, start, gates):
+def trace_line(W, H, start, gates, widen=True, stride=1, close_all=True):
     """Draw a racing line the AI can follow: walk the look-ahead point from the start cell
     through the gate midpoints in order (twice round, so the lap closes), writing the
     direction towards the next midpoint into each empty square it reads and then stepping
@@ -127,6 +128,7 @@ def trace_line(W, H, start, gates):
     x, z = start_point(start)
     targets = [(g.get('cx', g['x1'] + g['x2']) * 128, -g.get('cy', g['y1'] + g['y2']) * 128) for g in gates]   # racing points, as the respawn (0x41e8b0)
     targets[0] = (x, z)                                 # gate 0 is the start line: aim at the start
+    targets = targets[::stride]
     home = world_square(x, z)
     k = 0
     t = 0
@@ -138,20 +140,93 @@ def trace_line(W, H, start, gates):
                     break
                 c, r = world_square(x, z)
                 if not (0 <= c < W and 0 <= r < H):
-                    return line
+                    return _finish(line, first, W, H, home, widen)
                 sq = r * W + c
                 d = heading(tx - x, -(tz - z))
                 t += 1
-                if line[sq] == 0 and first[sq] == 0:
+                if line[sq] == 0 and first[sq] == 0 and (lap == 0 or close_all or n < 3 or n >= len(targets) - 3):
                     line[sq], first[sq] = d, t
                 elif (lap == 0 and line[sq] and t - first[sq] > 16 and (c, r) != home
                       and 4 <= (line[sq] - d) % 16 <= 12):
                     line[sq] = 0                        # the track crosses itself here
+                    first[sq] = -1
                 step = line[sq] or d
                 dx, dz = WSTEP[step]
                 x += dx
                 z += dz
-    return line
+    return _finish(line, first, W, H, home, widen)
+
+
+def _finish(line, first, W, H, home, widen):
+    """Clear crossings over their whole area: two squares side by side (or diagonally) whose
+    directions differ by 90 degrees or more and were written far apart in the walk are two
+    parts of the track crossing, not a turn. Both are left empty, so each pass keeps straight
+    on whichever square it happens to read. Then widen."""
+    clear = set()
+    for sq, d in enumerate(line):
+        if not d:
+            continue
+        c, r = sq % W, sq // W
+        for dc in (-1, 0, 1):
+            for dr in (-1, 0, 1):
+                c2, r2 = c + dc, r + dr
+                if (dc or dr) and 0 <= c2 < W and 0 <= r2 < H:
+                    q = r2 * W + c2
+                    e = line[q]
+                    if e and 4 <= (d - e) % 16 <= 12 and abs(first[sq] - first[q]) > 16:
+                        clear.update((sq, q))
+    for sq in clear:
+        if (sq % W, sq // W) != home:
+            line[sq] = 0
+            first[sq] = -1
+    return _widen(line, first, W, H) if widen else line
+
+
+STEP8 = {1: (0, -1), 3: (1, -1), 5: (1, 0), 7: (1, 1), 9: (0, 1), 11: (-1, 1), 13: (-1, 0), 15: (-1, -1)}
+
+
+def _widen(line, first, W, H):
+    """Make the line three squares wide (the shipped ones are two or three), so a point that
+    starts or is put back a little off the middle still lands on it. Only empty squares are
+    filled, never a crossing."""
+    out = list(line)
+    for sq, d in enumerate(line):
+        if not d:
+            continue
+        c, r = sq % W, sq // W
+        dx, dy = STEP8[d]
+        for px, py in ((-dy, dx), (dy, -dx)):          # the squares either side
+            c2, r2 = c + px, r + py
+            q = r2 * W + c2
+            if 0 <= c2 < W and 0 <= r2 < H and not line[q] and first[q] == 0 and not out[q]:
+                out[q] = d
+    return out
+
+
+def gate_grid(gates, W, H):
+    """The gate grid: each gate rasterised, the first one staying where gates overlap."""
+    grid = [-1] * (W * H)
+    for g in gates:
+        for x, y in bresenham(g['x1'], g['y1'], g['x2'], g['y2']):
+            if 0 <= x < W and 0 <= y < H and grid[y * W + x] < 0:
+                grid[y * W + x] = g['number']
+    return grid
+
+
+def make_line(m, laps=5):
+    """A racing line for map m (gates and gate grid set) that the AI laps in simulation: aim at
+    every gate's racing point, or failing that every 2nd or 3rd, with the later laps filling
+    gaps anywhere or only around the start; returns the first that laps, else the best."""
+    W, H = 4 * m['width'], 4 * m['height']
+    best, best_p = None, -1
+    for stride, close_all in ((1, True), (1, False), (2, True), (2, False), (3, True), (3, False)):
+        line = trace_line(W, H, m['start'], m['gates'], stride=stride, close_all=close_all)
+        p = lap_progress(m, follow_line(line, W, H, m['start'], 6000))
+        if p >= laps * len(m['gates']):
+            return line
+        if p > best_p:
+            best, best_p = line, p
+    return best
 
 
 def read(path):
@@ -186,16 +261,12 @@ def build(m):
     out = bytearray(struct.pack('<8H', w, h, m['start'][0], m['start'][1], m['world'], *m.get('header_rest', [0, 0, 0])))
     out += struct.pack('<%dH' % (w * h), *m['tiles'])
     line = m.get('line')
-    if line is None:                                   # draw the racing line from its points
-        line = trace_line(W, H, m['start'], m['gates'])
+    if line is None:                                   # draw the racing line from the gates
+        line = make_line(dict(m, gategrid=m.get('gategrid') or gate_grid(m['gates'], W, H)))
     out += bytes(line)
     grid = m.get('gategrid')
-    if grid is None:                                   # draw the gate grid from the gates
-        grid = [-1] * (W * H)
-        for g in m['gates']:
-            for x, y in bresenham(g['x1'], g['y1'], g['x2'], g['y2']):
-                if 0 <= x < W and 0 <= y < H and grid[y * W + x] < 0:   # where gates overlap the first one stays
-                    grid[y * W + x] = g['number']
+    if grid is None:
+        grid = gate_grid(m['gates'], W, H)
     out += struct.pack('<%dh' % (W * H), *grid)
     gates = m['gates']
     end = m.get('gate_end', [4, -1, -1, -1, -1, -1, -1, -1])   # None: no end marker
@@ -233,7 +304,7 @@ def main():
             m2 = dict(m, gategrid=None)
             regen = build(m2) == orig
             W, H = 4 * m['width'], 4 * m['height']
-            laps = lap_progress(m, follow_line(trace_line(W, H, m['start'], m['gates']), W, H, m['start'], 6000)) / len(m['gates'])
+            laps = lap_progress(m, follow_line(make_line(m), W, H, m['start'], 6000)) / len(m['gates'])
             print('%-12s %s  gates %3d  pickups %d  gate grid from gates: %s  generated line: %.1f laps' % (
                 f, 'exact' if same else 'DIFFERS', len(m['gates']),
                 sum(1 for p_ in m['pickups'] if p_[0] != 0xFF), 'exact' if regen else 'differs', laps))

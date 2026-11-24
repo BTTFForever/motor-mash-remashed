@@ -67,8 +67,11 @@ and most end records carry leftover values after the -1.
 ### How the AI uses the racing line
 
 Each car steers at a look-ahead point (car record +0x70 x, +0x110 z), and drags a queue of
-39 earlier points behind it. The point starts at the car's position: the start cell's
-centre at the start of a race, or a gate's racing point after a respawn. Setup is 0x421000.
+39 earlier points behind it. At the start of a race every car's point starts at the same
+place, the start cell's corner + 512 world units each way (0x420700). That is not quite
+the centre, and can be the square next to it. After a respawn it starts at the gate's
+racing point. Setup is 0x421000. If the point's first square is empty it has no direction
+at all: the cars drive at that one point until they wreck each other and respawn.
 
 Whenever the car catches up (0x421240), the point steps 128 world units in its current
 direction and reads the racing line where it lands (0x421a90). A tile is 1016 world units,
@@ -76,15 +79,25 @@ and the square for world (x, z) is `(x + x/1016*8) / 256`, `-(z + z/1016*8) / 25
 division. An empty square keeps the old direction. So a line works only if the walk itself
 stays on it all the way round.
 
-A generated line is drawn by doing that walk: from the start cell, through each gate's
-racing point in turn, writing the heading into every empty square the walk reads. Where
-the track crosses itself (90 degrees or more), the square is cleared so both ways keep
-straight on. The walk takes three laps, so the lap closes at the start line.
+A generated line is drawn by doing that walk: from the start point, through each gate's
+racing point in turn, writing the heading into every empty square the walk reads. The
+walk takes three laps, so the lap closes at the start line.
+
+Two more steps make it robust:
+- **Crossings.** Neighbouring squares that point 90 degrees or more apart, and were
+  written far apart in the walk, are where the track crosses itself. They are cleared
+  over the whole area, because each lap may cross a row or column off from the last.
+- **Width.** The line is widened to three squares, as the shipped lines are two or three
+  wide.
+
+`make_line` tries a few variants (every gate, every 2nd or 3rd; later laps filling gaps
+anywhere or only near the start). It keeps the first one that laps in simulation.
 
 Checks:
 - In simulation the generated line laps every shipped track.
-- In game, Amazon 3 with a generated line (raced from slot 9): AI about 3.8 gates/s,
-  against 4.3 on the original line, into lap 2.
+- In game, Amazon 3 with a generated line (raced from slot 9): the AI gets away from the
+  start normally and laps at about 3.6 gates/s, against 4.3 on the original line. The
+  hand-made lines take smoother lines through corners.
 - Copying a track whose scripted features matter (Amazon 1's lift) into slot 9 leaves the
   AI stuck at the door, because slots 9-16 have no trap or feature routines.
 
