@@ -33,6 +33,7 @@ typedef struct vkt {                    /* GPU copy of a texture */
     DWORD gen, palgen;
     void *pal;
     int keyed;
+    int filter;                         /* which sampler the descriptor set uses */
 } vkt;
 
 typedef struct rbatch {
@@ -43,6 +44,7 @@ typedef struct rbatch {
     DWORD color;                        /* clear colour / fog colour */
     int fog;
     int nodepth;                        /* debug: drawn without the depth test */
+    int cull;                           /* 1: back faces culled (meshes, as D3DRM) */
 } rbatch;
 
 static struct {
@@ -56,8 +58,8 @@ static struct {
     VkDescriptorSetLayout dsl;
     VkDescriptorPool pool;
     VkPipelineLayout layout;
-    VkPipeline pipe3d, pipe2d;
-    VkSampler smp_tex, smp_2d;
+    VkPipeline pipe3d, pipe2d, pipe3d_cull;
+    VkSampler smp_tex, smp_2d, smp_tex_smooth;
     VkBuffer vb, up;
     VkDeviceMemory vb_mem, up_mem;
     BYTE *vb_ptr, *up_ptr;
@@ -144,7 +146,7 @@ static int vr_make_targets(void)
     return 1;
 }
 
-static VkPipeline vr_pipeline(int depth)
+static VkPipeline vr_pipeline(int depth, int cull)
 {
     VkShaderModuleCreateInfo smi = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
     VkShaderModule vs, ps;
@@ -176,7 +178,7 @@ static VkPipeline vr_pipeline(int depth)
     vis.vertexAttributeDescriptionCount = 4; vis.pVertexAttributeDescriptions = va;
     ias.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     vps.viewportCount = 1; vps.scissorCount = 1;
-    rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE;
+    rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = cull ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE;
     rs.frontFace = VK_FRONT_FACE_CLOCKWISE; rs.lineWidth = 1;
     ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
     ds.depthTestEnable = depth; ds.depthWriteEnable = depth; ds.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
@@ -262,10 +264,14 @@ static int vr_init(void)
     si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
     si.maxLod = 0;
     vkCreateSampler(g_vk.dev, &si, NULL, &g_vkr.smp_tex);
+    si.magFilter = si.minFilter = VK_FILTER_LINEAR;     /* the "smooth" texture option */
+    vkCreateSampler(g_vk.dev, &si, NULL, &g_vkr.smp_tex_smooth);
+    si.magFilter = si.minFilter = VK_FILTER_NEAREST;
     si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     vkCreateSampler(g_vk.dev, &si, NULL, &g_vkr.smp_2d);
-    g_vkr.pipe3d = vr_pipeline(1);
-    g_vkr.pipe2d = vr_pipeline(0);
+    g_vkr.pipe3d = vr_pipeline(1, 0);
+    g_vkr.pipe3d_cull = vr_pipeline(1, 1);
+    g_vkr.pipe2d = vr_pipeline(0, 0);
     if (!vr_buffer(VR_VB_SIZE, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, &g_vkr.vb, &g_vkr.vb_mem, &g_vkr.vb_ptr)) return 0;
     if (!vr_buffer(VR_UP_SIZE, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &g_vkr.up, &g_vkr.up_mem, &g_vkr.up_ptr)) return 0;
     if (!vr_make_targets()) return 0;
@@ -357,6 +363,24 @@ static long vr_stage_texture(vtex *t, int *keyed)
             *d++ = c;
         }
     }
+    if (*keyed) {
+        /* transparent texels take the colour of an opaque neighbour, so smooth filtering does
+           not blend the (often black or magenta) key colour into the edges */
+        DWORD *p = (DWORD *)(g_vkr.up_ptr + g_vkr.up_used);
+        for (y = 0; y < h; y++)
+            for (x = 0; x < w; x++) {
+                static const int nx[4] = { -1, 1, 0, 0 }, ny[4] = { 0, 0, -1, 1 };
+                int k2;
+                if (p[y * w + x] >> 24) continue;
+                for (k2 = 0; k2 < 4; k2++) {
+                    int xx = x + nx[k2], yy = y + ny[k2];
+                    if (xx >= 0 && yy >= 0 && xx < w && yy < h && (p[yy * w + xx] >> 24)) {
+                        p[y * w + x] = p[yy * w + xx] & 0x00FFFFFF;
+                        break;
+                    }
+                }
+            }
+    }
     {
         long off = (long)g_vkr.up_used;
         g_vkr.up_used = (g_vkr.up_used + need + 15) & ~(size_t)15;
@@ -391,9 +415,22 @@ static vkt *vr_texture(VkCommandBuffer cmd, vtex *t)
         k->w = s->w; k->h = s->h;
         if (!vr_image(k->w, k->h, VK_FORMAT_B8G8R8A8_UNORM, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                       VK_IMAGE_ASPECT_COLOR_BIT, &k->img, &k->mem, &k->view)) { free(k); return &g_vkr.white; }
-        vr_set_texture_desc(k, g_vkr.smp_tex);
+        k->filter = g_vr_filter;
+        vr_set_texture_desc(k, k->filter ? g_vkr.smp_tex_smooth : g_vkr.smp_tex);
         k->gen = s->gen - 1;
         t->gpu = k;
+    }
+    if (k->filter != g_vr_filter && k->set) {   /* the texture option changed: point the set at the other sampler */
+        static int idle_gen = -1;
+        VkDescriptorImageInfo ii;
+        VkWriteDescriptorSet w = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+        if (idle_gen != g_vr_filter) { vkDeviceWaitIdle(g_vk.dev); idle_gen = g_vr_filter; }   /* sets may be in use */
+        k->filter = g_vr_filter;
+        ii.sampler = k->filter ? g_vkr.smp_tex_smooth : g_vkr.smp_tex; ii.imageView = k->view;
+        ii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        w.dstSet = k->set; w.dstBinding = 0; w.descriptorCount = 1;
+        w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w.pImageInfo = &ii;
+        vkUpdateDescriptorSets(g_vk.dev, 1, &w, 0, NULL);
     }
     if (k->gen != s->gen || k->pal != (void *)s->pal || k->palgen != vr_tex_palgen(s) || t->gpu_gen == 0) {
         long off = vr_stage_texture(t, &k->keyed);
@@ -425,16 +462,16 @@ static rbatch *vr_batch(void)
 }
 
 /* the batch that the next triangles for (tex, viewport, fog) go into */
-static rbatch *vr_target(vrmvp *vp, vtex *tex, int fog, DWORD fogcol)
+static rbatch *vr_target(vrmvp *vp, vtex *tex, int fog, DWORD fogcol, int cull)
 {
     rbatch *b = g_vkr.nb ? &g_vkr.b[g_vkr.nb - 1] : NULL;
     if (b && !b->clear && b->tex == tex && b->vx == vp->x && b->vy == vp->y && b->vw == (LONG)vp->w &&
-        b->vh == (LONG)vp->h && b->fog == fog && b->color == fogcol && b->first + b->count == g_vkr.nv) return b;
+        b->vh == (LONG)vp->h && b->fog == fog && b->color == fogcol && b->cull == cull && b->first + b->count == g_vkr.nv) return b;
     b = vr_batch();
     b->tex = tex; VRM_ADDREF(tex);
     b->first = g_vkr.nv;
     b->vx = vp->x; b->vy = vp->y; b->vw = vp->w; b->vh = vp->h;
-    b->fog = fog; b->color = fogcol;
+    b->fog = fog; b->color = fogcol; b->cull = cull;
     return b;
 }
 
@@ -535,7 +572,7 @@ static void vr_draw_mesh(rctx *c, vmb *mb, MAT world)
         if (!g->nv) continue;
         if (!(v = vr_alloc(g->nv))) return;
         g_vkr.nv -= g->nv;                       /* re-reserve after picking the batch */
-        b = vr_target(c->vp, tex, c->fog, c->fog_col);
+        b = vr_target(c->vp, tex, c->fog, c->fog_col, !g_vr_backfaces);
         v = vr_alloc(g->nv);
         base[0] = g->col[0]; base[1] = g->col[1]; base[2] = g->col[2];
         if (mb->color != 0xFFFFFFFF && !g->tex) {
@@ -631,30 +668,7 @@ static void vr_draw_decal(rctx *c, vtex *t, MAT world)
         k = zq / p[2];   /* scale the corners so the size on screen stays the same */
         for (i = 0; i < 4; i++) { q[i][0] *= k; q[i][1] *= k; q[i][2] = zq; }
     }
-    {
-        static int dbg = -1;
-        if (dbg < 0) dbg = GetEnvironmentVariableA("MMCDA_DECALDBG", NULL, 0) != 0;
-        if (dbg) {   /* debug: solid magenta squares where decals are drawn */
-            b = vr_batch();
-            b->first = g_vkr.nv; b->vx = c->vp->x; b->vy = c->vp->y; b->vw = c->vp->w; b->vh = c->vp->h;
-            b->nodepth = 1;
-            if (!(v = vr_alloc(6))) return;
-            for (i = 0; i < 6; i++) {
-                vr_clip(c, q[order[i]], v[i].p);
-                v[i].uv[0] = v[i].uv[1] = 0; v[i].col = 0xFFFF00FF; v[i].fog = 1;
-            }
-            b->count += 6;
-            {
-                static int nlog;
-                if (tw == 32 && nlog++ < 12)
-                    log_msg("vkr: decal quad cam (%.1f %.1f %.1f) corners (%.1f %.1f)-(%.1f %.1f) clip0 %.1f %.1f %.1f %.1f vp %ld,%ld %lux%lu plane %.3f..%.3f %.3f..%.3f",
-                            p[0], p[1], p[2], q[0][0], q[0][1], q[2][0], q[2][1], v[0].p[0], v[0].p[1], v[0].p[2], v[0].p[3],
-                            c->vp->x, c->vp->y, c->vp->w, c->vp->h, c->l, c->r, c->b, c->t);
-            }
-            return;
-        }
-    }
-    b = vr_target(c->vp, t, c->fog, c->fog_col);
+    b = vr_target(c->vp, t, c->fog, c->fog_col, 0);
     if (!(v = vr_alloc(6))) return;
     for (i = 0; i < 6; i++) {
         vr_clip(c, q[order[i]], v[i].p);
@@ -843,28 +857,6 @@ static void vr_record(VkCommandBuffer cmd, uint32_t idx, int dx, int dy, int dw,
     rb.renderPass = g_vkr.pass; rb.framebuffer = g_vkr.fb[idx];
     rb.renderArea.extent = g_vk.extent;
     rb.clearValueCount = 2; rb.pClearValues = cv;
-    if (GetEnvironmentVariableA("MMCDA_DECALDBG", NULL, 0)) {   /* plus a fixed untextured square */
-        rbatch *tb = vr_batch();
-        rvert *tv;
-        tb->first = g_vkr.nv; tb->vx = 0; tb->vy = 0; tb->vw = mode_w; tb->vh = mode_h; tb->nodepth = 1;
-        if ((tv = vr_alloc(6))) {
-            static const float q2[6][2] = { { -0.1f, -0.1f }, { 0.1f, -0.1f }, { 0.1f, 0.1f }, { -0.1f, -0.1f }, { 0.1f, 0.1f }, { -0.1f, 0.1f } };
-            for (i = 0; i < 6; i++) { tv[i].p[0] = q2[i][0]; tv[i].p[1] = q2[i][1]; tv[i].p[2] = 0.5f; tv[i].p[3] = 1; tv[i].uv[0] = tv[i].uv[1] = 0; tv[i].col = 0xFF00FFFF; tv[i].fog = 1; }
-            tb->count = 6;
-            memcpy(g_vkr.vb_ptr, g_vkr.v, g_vkr.nv * sizeof(rvert));
-        }
-    }
-    if (GetEnvironmentVariableA("MMCDA_DECALDBG", NULL, 0)) {
-        static int fr;
-        int nd = 0, first = -1;
-        for (i = 0; i < g_vkr.nb; i++) if (g_vkr.b[i].nodepth) { nd++; if (first < 0) first = i; }
-        if (nd && fr++ % 30 == 0) {
-            rbatch *b = &g_vkr.b[first];
-            rvert *v = &g_vkr.v[b->first];
-            log_msg("vkr: record: %d decal batches of %d; first #%d count %d vp %ld,%ld %ldx%ld v0 %.1f %.1f %.1f %.1f kx %.3f dx %d dw %d",
-                    nd, g_vkr.nb, first, b->count, b->vx, b->vy, b->vw, b->vh, v->p[0], v->p[1], v->p[2], v->p[3], kx, dx, dw);
-        }
-    }
     vkCmdBeginRenderPass(cmd, &rb, VK_SUBPASS_CONTENTS_INLINE);
     vkCmdBindVertexBuffers(cmd, 0, 1, &g_vkr.vb, &zero);
     for (pass = 0; pass < 2; pass++)
@@ -911,7 +903,7 @@ static void vr_record(VkCommandBuffer cmd, uint32_t idx, int dx, int dy, int dw,
             vpt.x = (float)(dx + b->vx * kx); vpt.y = (float)(dy + b->vy * ky);
             vpt.width = (float)(b->vw * kx); vpt.height = (float)(b->vh * ky);
             vpt.minDepth = 0; vpt.maxDepth = 1;
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, b->nodepth ? g_vkr.pipe2d : g_vkr.pipe3d);
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, b->nodepth ? g_vkr.pipe2d : b->cull ? g_vkr.pipe3d_cull : g_vkr.pipe3d);
             vkCmdSetViewport(cmd, 0, 1, &vpt);
             vkCmdSetScissor(cmd, 0, 1, &sc);
             vkCmdPushConstants(cmd, g_vkr.layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16, fogc);

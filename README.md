@@ -189,7 +189,7 @@ Needs Visual Studio 2022 (C++ desktop, x86) and Python 3.
 
 | Part | Folder | Build |
 |---|---|---|
-| Patch DLL (all features) | `tools/mmcda` | `cl /O2 /MT /LD mmcda.c /link /DEF:mmcda.def /OUT:MMCDA.dll winmm.lib user32.lib gdi32.lib` (x86 developer prompt) |
+| Patch DLL (all features) | `tools/mmcda` | `cl /O2 /MT /LD /Ithird_party/vulkan/include mmcda.c /link /DEF:mmcda.def /OUT:MMCDA.dll winmm.lib user32.lib gdi32.lib dxguid.lib` (x86 developer prompt; the Vulkan renderer needs only the bundled headers, `vulkan-1.dll` comes with the graphics driver) |
 | Installer / patcher | `tools/patcher` | `python build.py` (embeds MMCDA.dll, SDL3, dgVoodoo2) |
 | Exe patch reference | `tools/patch_motormsh.py` | the byte patches the installer applies |
 | Six-car relocation table | `tools/sixcars/gen_relocs.py` | regenerates `tools/mmcda/relocs.h` from a disassembly of your own `MotorMsh.exe` |

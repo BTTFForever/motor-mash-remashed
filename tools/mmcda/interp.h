@@ -152,6 +152,35 @@ static void lerp_mat(MAT4 out, MAT4 a, MAT4 b, float t)
     }
 }
 
+/* debug (MMCDA_INTERPDIAG, Vulkan): after each real tick, find frames whose local transform
+   changed although none of the hooked calls touched them (so they are not blended) */
+static void interp_diag_walk(vframe *f, int depth, int *moved, int *untracked)
+{
+    static struct { vframe *f; MAT m; DWORD tick; int logged; } seen[4096];
+    static int nseen;
+    int i;
+    if (!f || depth > 32) return;
+    for (i = 0; i < nseen && seen[i].f != f; i++) ;
+    if (i == nseen && nseen < 4096) { seen[nseen].f = f; memcpy(seen[nseen].m, f->m, sizeof(MAT)); seen[nseen].tick = g_tick; seen[nseen].logged = 0; nseen++; }
+    else if (i < nseen) {
+        if (memcmp(seen[i].m, f->m, sizeof(MAT))) {
+            struct tracked *t = trk_find(f, 0);
+            (*moved)++;
+            if (!t || t->dirty_tick != g_tick) {
+                (*untracked)++;
+                if (seen[i].logged < 2) {
+                    seen[i].logged++;
+                    log_msg("interpdiag: frame %p untracked move (depth %d, %d visuals, %d kids, rot %.3f, pos %.1f %.1f %.1f -> %.1f %.1f %.1f)",
+                            (void *)f, depth, f->visuals.n, f->kids.n, f->rot_theta, seen[i].m[3][0], seen[i].m[3][1], seen[i].m[3][2],
+                            f->m[3][0], f->m[3][1], f->m[3][2]);
+                }
+            }
+            memcpy(seen[i].m, f->m, sizeof(MAT));
+        }
+    }
+    for (i = 0; i < f->kids.n; i++) interp_diag_walk((vframe *)f->kids.p[i], depth + 1, moved, untracked);
+}
+
 /* viewport->Render(scene): capture after a logic tick, blend, render, restore */
 static void vr_capture(void);                            /* vrexport.h */
 static void (*g_census_frame)(void);                     /* census.h, game thread */
@@ -222,6 +251,17 @@ static HRESULT WINAPI h_vp_render(void *vp, void *scene)
                 if (dx * dx + dy * dy + dz * dz > 60.0f * 60.0f) memcpy(t->prev, t->cur, sizeof(MAT4));
             }
             t->valid_tick = g_tick;
+        }
+    }
+    if (!g_in_extra && g_render_vulkan && GetEnvironmentVariableA("MMCDA_INTERPDIAG", NULL, 0)) {
+        static DWORD last; static int tm, tu, ticks;
+        int moved = 0, untracked = 0;
+        interp_diag_walk((vframe *)scene, 0, &moved, &untracked);
+        tm += moved; tu += untracked; ticks++;
+        if (GetTickCount() - last > 5000) {
+            last = GetTickCount();
+            log_msg("interpdiag: %d ticks, %.1f frames moved per tick, %.1f of them untracked", ticks, (double)tm / ticks, (double)tu / ticks);
+            tm = tu = ticks = 0;
         }
     }
     if (g_alpha_fixed >= 0.0f) {

@@ -579,12 +579,6 @@ static void pad_setup_frame(void)
     BYTE desc[0x6C];
     struct lockinfo lk;
     int h;
-    {   /* debug: MMCDA_OPENSETUP opens the setup screen once the menus are up */
-        static int auto_done;
-        if (!auto_done && g_font_ready && GetEnvironmentVariableA("MMCDA_OPENSETUP", NULL, 0)) {
-            auto_done = 1; g_ps.started = 0; g_pad_setup_open = 1;
-        }
-    }
     g_vr_2d_only = g_pad_setup_open && !g_cal_inpage;
     if (!g_pad_setup_open) return;
     if (!g_ps.started) {

@@ -32,7 +32,7 @@ static const int k_draw_dist[] = { -1, 2, 4, 8, 16, 0 };
 #define N_DRAW_DIST 6
 
 /* ---- items ---------------------------------------------------------------------------- */
-enum { IT_TRACK, IT_CAMERA, IT_ZOOM, IT_HUD, IT_LAYOUT, IT_DIST, IT_SMOOTH, IT_SAVE, IT_COUNT };
+enum { IT_TRACK, IT_CAMERA, IT_ZOOM, IT_HUD, IT_LAYOUT, IT_DIST, IT_SMOOTH, IT_FILTER, IT_BACKFACE, IT_SAVE, IT_COUNT };
 
 static void track_name(int idx, char *out, size_t n)
 {
@@ -57,6 +57,8 @@ static void item_text(int it, char *out, size_t n)
         else snprintf(out, n, "Draw dist   %d tiles", g_tiles_radius);
         break;
     case IT_SMOOTH: snprintf(out, n, "Smooth      %s", g_interp_on ? "On" : "Off"); break;
+    case IT_FILTER: snprintf(out, n, "Textures    %s", g_vr_filter ? "Smooth" : "Sharp"); break;
+    case IT_BACKFACE: snprintf(out, n, "Back faces  %s", g_vr_backfaces ? "Shown" : "Hidden"); break;
     case IT_SAVE:   snprintf(out, n, "Save settings"); break;
     }
 }
@@ -91,6 +93,8 @@ static void item_change(int it, int dir)
         g_tiles_wc = g_tiles_wr = 0x7fffffff;      /* force a visibility refresh */
         break;
     case IT_SMOOTH: g_interp_on = !g_interp_on; break;
+    case IT_FILTER: g_vr_filter = !g_vr_filter; break;
+    case IT_BACKFACE: g_vr_backfaces = !g_vr_backfaces; log_msg("debug menu: back faces %s", g_vr_backfaces ? "shown" : "hidden"); break;
     case IT_SAVE: save_zoom(); log_msg("debug menu: settings saved"); break;
     }
 }
@@ -211,31 +215,6 @@ static void font_capture(void)
     g_font[' '].adv = WIDTH_OF(' ') > 0 ? WIDTH_OF(' ') : 5;
     g_font_ready = n > 20;
     log_msg("debug menu: captured %d font glyphs (%d bpp, height %d)", n, g_font_bpp, g_font_h);
-    if (GetEnvironmentVariableA("MMCDA_SPRDUMP", NULL, 0)) {   /* debug: the big loaded sprites, as sprNNN.bin */
-        int id;
-        for (id = 0; id < 0x1AB; id++) {
-            int slot = LOADED_SPRITE[id], w, h, x, y, packed;
-            BYTE *rec, *hdr, *src;
-            char path[MAX_PATH];
-            FILE *f;
-            if (slot < 0) continue;
-            rec = SPR_REC(slot); hdr = *(BYTE **)rec; src = *(BYTE **)(rec + 4);
-            w = *(int *)(rec + 0x408); h = *(int *)(rec + 0x40C);
-            if (!hdr || !src || w < 64 || h < 64) continue;
-            log_msg("sprite %d: slot %d, %dx%d, %d bit", id, slot, w, h, hdr[0xE]);
-            snprintf(path, sizeof path, "%sspr%03d.bin", g_home, id);
-            if (!(f = fopen(path, "wb"))) continue;
-            packed = hdr[0xE] <= 0x10;
-            fwrite(&w, 4, 1, f); fwrite(&h, 4, 1, f);
-            for (y = 0; y < h; y++)
-                for (x = 0; x < w; x++) {
-                    int i = y * w + x, c = packed ? ((x & 1) ? src[i / 2] & 0xF : (src[i / 2] >> 4) & 0xF) : src[i];
-                    DWORD v = c ? conv_px(((DWORD *)(rec + 8))[c], g_font_bpp, 32) : 0xFF00FF;
-                    fwrite(&v, 4, 1, f);
-                }
-            fclose(f);
-        }
-    }
 }
 
 /* paint into a locked surface; colours converted between 16-bit 565 and 32-bit if needed */

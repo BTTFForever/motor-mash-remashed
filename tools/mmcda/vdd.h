@@ -217,13 +217,6 @@ static HRESULT WINAPI vsurf_Lock(vsurf *s, RECT *r, DDSURFACEDESC *d, DWORD f, H
 {
     VTRACE("Lock %p(%dx%dx%d caps %lX)", s, s->w, s->h, s->bpp, s->caps);
     (void)f; (void)ev;
-    if (s->w == 320 && s->h >= 200 && GetEnvironmentVariableA("MMCDA_BGTRACE", NULL, 0)) {
-        static DWORD seen[32]; static int n;
-        DWORD ra = (DWORD)_ReturnAddress();
-        int i;
-        for (i = 0; i < n && seen[i] != ra; i++) ;
-        if (i == n && n < 32) { seen[n++] = ra; log_msg("bgtrace: Lock %p %dx%d caps %lX from %08lX", (void *)s, s->w, s->h, s->caps, ra); }
-    }
     vsurf_fill_desc(s, d);
     d->dwFlags |= DDSD_LPSURFACE;
     d->lpSurface = s->bits + (r ? (size_t)r->top * s->pitch + r->left * (s->bpp / 8) : 0);
@@ -235,13 +228,6 @@ static HRESULT WINAPI vsurf_Unlock(vsurf *s, void *p) { (void)p; s->gen++; retur
 static HRESULT WINAPI vsurf_GetDC(vsurf *s, HDC *out)
 {
     VTRACE("GetDC %p(%dx%d caps %lX)", s, s->w, s->h, s->caps);
-    if (GetEnvironmentVariableA("MMCDA_BGTRACE", NULL, 0)) {
-        static DWORD seen[32]; static int n;
-        DWORD ra = (DWORD)_ReturnAddress();
-        int i;
-        for (i = 0; i < n && seen[i] != ra; i++) ;
-        if (i == n && n < 32) { seen[n++] = ra; log_msg("bgtrace: GetDC %p %dx%d caps %lX from %08lX", (void *)s, s->w, s->h, s->caps, ra); }
-    }
     if (!s->dib) return DDERR_CANTCREATEDC;
     if (!s->dc) {
         s->dc = CreateCompatibleDC(NULL);
@@ -335,19 +321,6 @@ static void vsurf_copy(vsurf *d, const RECT *dr0, vsurf *s, const RECT *sr0, int
     d->gen++;
 }
 
-/* debug (MMCDA_BGTRACE): who copies a full-screen picture onto the back buffer */
-static void vdd_bgtrace(vsurf *d, const RECT *dr, vsurf *s, DWORD ra)
-{
-    static struct { void *s; DWORD ra; } seen[32];
-    static int n;
-    int i;
-    if (!s || !GetEnvironmentVariableA("MMCDA_BGTRACE", NULL, 0)) return;
-    if (!(d->caps & DDSCAPS_BACKBUFFER) && dr && (dr->right - dr->left) * (dr->bottom - dr->top) < 160 * 120) return;
-    for (i = 0; i < n; i++) if (seen[i].s == s && seen[i].ra == ra) return;
-    if (n < 32) { seen[n].s = s; seen[n].ra = ra; n++; }
-    log_msg("bgtrace: %p (%dx%d) -> %p %dx%d at %ld,%ld-%ld,%ld from %08lX", s, s->w, s->h, (void *)d, d->w, d->h,
-            dr ? dr->left : 0, dr ? dr->top : 0, dr ? dr->right : 0, dr ? dr->bottom : 0, ra);
-}
 static HRESULT WINAPI vsurf_Blt(vsurf *d, RECT *dr, vsurf *s, RECT *sr, DWORD f, DDBLTFX *fx)
 {
     VTRACE("Blt dst %p(%dx%d caps %lX) src %p(%dx%d) flags %lX", d, d->w, d->h, d->caps, s, s ? s->w : 0, s ? s->h : 0, f);
@@ -366,7 +339,6 @@ static HRESULT WINAPI vsurf_Blt(vsurf *d, RECT *dr, vsurf *s, RECT *sr, DWORD f,
         DWORD key = 0;
         if ((f & DDBLT_KEYSRCOVERRIDE) && fx) { keyed = 1; key = fx->ddckSrcColorkey.dwColorSpaceLowValue; }
         else if ((f & DDBLT_KEYSRC) && s->has_ck) { keyed = 1; key = s->ck_src.dwColorSpaceLowValue; }
-        vdd_bgtrace(d, dr, s, (DWORD)_ReturnAddress());
         vsurf_copy(d, dr, s, sr, keyed, key);
     } else {
         static int once;
@@ -380,7 +352,6 @@ static HRESULT WINAPI vsurf_BltFast(vsurf *d, DWORD x, DWORD y, vsurf *s, RECT *
     VTRACE("BltFast dst %p(%dx%d caps %lX) at %lu,%lu src %p(%dx%d)", d, d->w, d->h, d->caps, x, y, s, s->w, s->h);
     RECT r = sr ? *sr : (RECT){ 0, 0, s->w, s->h }, dr;
     SetRect(&dr, x, y, x + (r.right - r.left), y + (r.bottom - r.top));
-    vdd_bgtrace(d, &dr, s, (DWORD)_ReturnAddress());
     vsurf_copy(d, &dr, s, &r, (trans & DDBLTFAST_SRCCOLORKEY) && s->has_ck, s->ck_src.dwColorSpaceLowValue);
     if (d->is_primary && d == g_vdd.primary) vdd_present(d);
     return DD_OK;
@@ -440,35 +411,6 @@ static void vdd_present(vsurf *frame)
 {
     int aw = frame->w, ah = frame->h;
     vsurf *prim = g_vdd.primary;
-    {   /* MMCDA_VKDUMP=n: write the n-th presented frame to vkframe.bin (w, h, bpp, pitch, bits) */
-        static int count, want = -1;
-        if (want < 0) { char v[16] = ""; GetEnvironmentVariableA("MMCDA_VKDUMP", v, sizeof v); want = atoi(v); }
-        if (want > 0 && ++count == want) {
-            char path[MAX_PATH]; FILE *f;
-            snprintf(path, sizeof path, "%svkframe.bin", g_home);
-            if ((f = fopen(path, "wb"))) {
-                int hdr[4] = { frame->w, frame->h, frame->bpp, frame->pitch };
-                fwrite(hdr, sizeof hdr, 1, f); fwrite(frame->bits, frame->pitch, frame->h, f); fclose(f);
-            }
-        }
-    }
-    {   /* MMCDA_SEQ=1: dump the 2D layer of the first 40 frames of each non-menu mode (vkseq_NN.bin) */
-        static int seq = -1, n, lastw;
-        if (seq < 0) seq = GetEnvironmentVariableA("MMCDA_SEQ", NULL, 0) != 0;
-        if (frame->w != lastw) { n = 0; lastw = frame->w; }
-        if (seq && frame->w != 320 && n < 40) {
-            char path[MAX_PATH]; FILE *f;
-            if (n == 5 || n == 15 || n == 25 || n == 36 || n == 39) {   /* game globals snapshot */
-                snprintf(path, sizeof path, "%svkmem_%02d.bin", g_home, n);
-                if ((f = fopen(path, "wb"))) { fwrite((void *)0x43E000, 1, 0x635000 - 0x43E000, f); fclose(f); }
-            }
-            snprintf(path, sizeof path, "%svkseq_%02d.bin", g_home, n++);
-            if ((f = fopen(path, "wb"))) {
-                int hdr[4] = { frame->w, frame->h, frame->bpp, frame->pitch };
-                fwrite(hdr, sizeof hdr, 1, f); fwrite(frame->bits, frame->pitch, frame->h, f); fclose(f);
-            }
-        }
-    }
     if (!g_vdd.wnd || !vkp_init(g_vdd.wnd)) return;
     if (aw * 5 == ah * 8) ah = aw * 3 / 4;          /* 320x200 / 640x400 shown at 4:3 */
     vkp_present(frame->bits, frame->w, frame->h, frame->pitch, frame->bpp,

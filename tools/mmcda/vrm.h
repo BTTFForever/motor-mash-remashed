@@ -573,7 +573,12 @@ static DWORD vrm_rgb(float r, float g, float b)
 static HRESULT WINAPI vframe_SetSceneBackgroundRGB(vframe *f, float r, float g, float b) { f->bg = vrm_rgb(r, g, b); return S_OK; }
 static HRESULT WINAPI vframe_SetSceneBackgroundDepth(vframe *f, void *s) { (void)f; (void)s; return S_OK; }
 static HRESULT WINAPI vframe_SetSceneBackgroundImage(vframe *f, vrmobj *t) { VRM_ADDREF(t); VRM_RELEASE(f->bg_image); f->bg_image = t; return S_OK; }
-static HRESULT WINAPI vframe_SetSceneFogEnable(vframe *f, BOOL on) { f->fog_on = on; return S_OK; }
+static HRESULT WINAPI vframe_SetSceneFogEnable(vframe *f, BOOL on)
+{
+    if (on != f->fog_on) log_msg("vrm: scene fog %s (mode %d, %.1f..%.1f, density %.3f, colour %08lX)", on ? "on" : "off",
+                                 f->fog_mode, f->fog_start, f->fog_end, f->fog_density, f->fog_color);
+    f->fog_on = on; return S_OK;
+}
 static BOOL WINAPI vframe_GetSceneFogEnable(vframe *f) { return f->fog_on; }
 static HRESULT WINAPI vframe_SetSceneFogColor(vframe *f, DWORD c) { f->fog_color = c; return S_OK; }
 static DWORD WINAPI vframe_GetSceneFogColor(vframe *f) { return f->fog_color; }

@@ -70,6 +70,56 @@ static void render_menu_poll(void)
     log_msg("render: menu choice %s (applies at the next start)", (g_render_choice & 0x8000) ? "vulkan" : "original");
 }
 
+/* Cancel: the menu keeps a copy of the settings word when it opens (0x40e991: mov [0x506f60],
+   ecx) and copies it back on Cancel (0x40eaf5 / 0x40eb71: mov [0x43f20c], ecx / edx). The
+   Renderer row has its own variable, so it is copied and restored alongside. */
+static DWORD g_render_entry;
+static __declspec(naked) void rm_open_thunk(void)
+{
+    __asm {
+        mov dword ptr ds:[0x00506F60], ecx
+        push eax
+        mov eax, g_render_choice
+        mov g_render_entry, eax
+        pop eax
+        ret
+    }
+}
+static __declspec(naked) void rm_cancel_ecx_thunk(void)
+{
+    __asm {
+        mov dword ptr ds:[0x0043F20C], ecx
+        push eax
+        mov eax, g_render_entry
+        mov g_render_choice, eax
+        pop eax
+        ret
+    }
+}
+static __declspec(naked) void rm_cancel_edx_thunk(void)
+{
+    __asm {
+        mov dword ptr ds:[0x0043F20C], edx
+        push eax
+        mov eax, g_render_entry
+        mov g_render_choice, eax
+        pop eax
+        ret
+    }
+}
+
+static int render_patch_call6(DWORD site, const BYTE *expect, void *fn)
+{
+    DWORD old;
+    BYTE *p = (BYTE *)site;
+    if (memcmp(p, expect, 6) != 0) return 0;
+    VirtualProtect(p, 6, PAGE_EXECUTE_READWRITE, &old);
+    p[0] = 0xE8; *(INT32 *)(p + 1) = (INT32)((BYTE *)fn - (p + 5)); p[5] = 0x90;
+    VirtualProtect(p, 6, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), p, 6);
+    return 1;
+}
+
 static int render_patch_operand(DWORD site, int off, const BYTE *expect, int n, DWORD value)
 {
     DWORD old;
@@ -105,6 +155,14 @@ static void install_render_menu(void)
                   k[i].what == 2 ? (DWORD)g_rm_on : (DWORD)&g_render_choice;
         ok += render_patch_operand(k[i].site, k[i].off, k[i].b, k[i].n, v);
     }
+    {
+        static const BYTE open_b[6] = { 0x89, 0x0D, 0x60, 0x6F, 0x50, 0x00 };
+        static const BYTE cx_b[6] = { 0x89, 0x0D, 0x0C, 0xF2, 0x43, 0x00 }, dx_b[6] = { 0x89, 0x15, 0x0C, 0xF2, 0x43, 0x00 };
+        g_render_entry = g_render_choice;
+        if (!(render_patch_call6(0x40E991, open_b, rm_open_thunk) && render_patch_call6(0x40EAF5, cx_b, rm_cancel_ecx_thunk) &&
+              render_patch_call6(0x40EB71, dx_b, rm_cancel_edx_thunk)))
+            log_msg("render: Display menu Cancel sites not found (Cancel keeps the Renderer choice)");
+    }
     log_msg("render: Display menu shows Renderer (%d/8 sites)", ok);
 }
 
@@ -116,6 +174,12 @@ static void install_render_backend(void)
     FARPROC rmc = GetProcAddress(GetModuleHandleA("d3drm.dll"), "Direct3DRMCreate");
     int i, ok = 0;
     snprintf(path, sizeof path, "%smmcda.ini", g_home);
+    {   /* 3D texture filtering (Vulkan): sharp as the original, or smooth */
+        char f[16];
+        GetPrivateProfileStringA("render", "filter", "sharp", f, sizeof f, path);
+        GetEnvironmentVariableA("MMCDA_FILTER", f, sizeof f);   /* testing */
+        g_vr_filter = _stricmp(f, "smooth") == 0;
+    }
     GetPrivateProfileStringA("render", "backend", "original", v, sizeof v, path);
     GetEnvironmentVariableA("MMCDA_RENDER", v, sizeof v);
     if (_stricmp(v, "vulkan") != 0) { log_msg("render: original (D3DRM + DirectDraw)"); return; }

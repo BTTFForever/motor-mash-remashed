@@ -136,13 +136,30 @@ Findings that shaped it:
   next to mmcda.ini makes the renderer write its next frame to `vkshot.bmp` (screenshots
   can't see a borderless Vulkan window).
 
-**Still to do:** HUD size in the Vulkan path, comparison with the original (lighting, culling,
-decals for smoke and dust, fog), a texture filtering option, VSync and frame pacing with the
-interpolation code, then performance.
+**Stage 3 (2026-11-24): parity and options.**
+- Look: race starts compared pixel by pixel with the original renderer on Amazon. Average colours
+  match within 1-3 levels; the remaining per-pixel differences are texture sampling at polygon
+  edges. No track turns fog on (checked one track per world), so fog is not part of parity.
+- Back faces are culled like D3DRM (meshes only; decals stay double-sided). F10 debug menu:
+  "Back faces Shown" draws them too, for testing.
+- Texture filtering: `[render] filter = sharp | smooth` (F10 menu: Textures). Sharp is the
+  original look (neither software D3DRM nor the PS1 filtered textures). Smooth uses linear
+  sampling; colour-keyed texels take a neighbour's colour so edges don't fringe. Menus and the
+  HUD stay sharp.
+- Interpolation works unchanged on Vulkan: 120 Hz locks one tick to 4 vsyncs. A walk of the
+  scene after each tick finds no untracked movers. About one frame in 10 s misses a vsync,
+  with the time spent inside Present (the game's own work is ~5 ms).
+- Display menu Cancel restores the Renderer choice with the game's settings word.
 
-**Next, stage 2 (original plan):** Viewport::Render walks the frame tree and draws with Vulkan. Decals
-(texture visuals: title, menus, sprites) come first, then the `.x` loader for MeshBuilder Load
-and AnimationSet Load, then lighting and fog.
+**Still to do:** frame pacing in Present (exclusive / independent flip), optional fog as an
+extra, performance.
 
-Debug switches: `MMCDA_VDDTRACE=1` logs DirectDraw calls; `MMCDA_VKDUMP=n` writes the n-th
-presented 2D frame to `vkframe.bin`.
+Debug switches (environment variables):
+- `MMCDA_RENDER=original|vulkan`, `MMCDA_FILTER=sharp|smooth`, `MMCDA_TRACK=n` (world*16 + track)
+- `MMCDA_VKDEBUG=1`: magenta clear and batch counts; `vkshot.req` next to mmcda.ini writes the
+  next frame to `vkshot.bmp` plus the 2D layers (`vkshot2d.bin`, `vkshot2u.bin`)
+- `MMCDA_INTROSHOT=1`: capture the race loading screen
+- `MMCDA_PACEDIAG=1`: log race frames that miss a vsync; `MMCDA_INTERPDIAG=1`: log frames that
+  move without being interpolated
+- `MMCDA_INPUTLOG=1`: log keys/clicks in the game window (to record a menu path)
+- `MMCDA_VDDTRACE=1`, `MMCDA_VRMTRACE=1`: DirectDraw / D3DRM call traces; `MMCDA_CENSUS=1`: call census

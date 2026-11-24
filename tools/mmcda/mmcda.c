@@ -38,6 +38,16 @@ static HANDLE g_thread, g_done;
 static volatile LONG g_generation;
 static DWORD g_volume = 0xFFFFFFFF;
 static char g_dir[MAX_PATH];    /* folder of the running exe (music lives here) */
+static double now_ms_qpc(void)
+{
+    static LARGE_INTEGER f;
+    LARGE_INTEGER c;
+    if (!f.QuadPart) QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c);
+    return c.QuadPart * 1000.0 / f.QuadPart;
+}
+static volatile int g_vr_filter;      /* 3D textures: 0 sharp (as the original), 1 smooth */
+static volatile int g_vr_backfaces;   /* test mode: draw back faces too (D3DRM culls them) */
 static volatile int g_vr_2d_only;   /* a full-screen 2D page (controller setup): no see-through black */
 static volatile int g_shot_force;   /* debug: ask the Vulkan presenter to capture this frame */
 static char g_home[MAX_PATH];   /* settings + log: MMCDA_HOME, else g_dir */
@@ -606,20 +616,6 @@ static HRESULT WINAPI hud_blt_inner(void *dst, RECT *dr, void *src, RECT *sr, DW
    and his feet are below row 200: give the loading screen 240 rows, as later races get. */
 static int __cdecl overlay_rows_flag(void)
 {
-    if (GetEnvironmentVariableA("MMCDA_SPRLIST", NULL, 0)) {   /* debug: each pass's sprite list, every 10 s */
-        static DWORD last; static int passes;
-        if (GetTickCount() - last > 10000) { last = GetTickCount(); passes = 3; }
-        if (passes > 0) {
-            int i, n = *(volatile int *)0x00504FA4;
-            passes--;
-            log_msg("sprpass: %d sprites", n);
-            for (i = 0; i < n && i < 120; i++) {
-                int *e = (int *)(0x00503828 + i * 12);
-                BYTE *rec = (BYTE *)0x0048F378 + e[0] * 0x410;
-                log_msg("  slot %d at %d,%d size %dx%d", e[0], e[1], e[2], *(int *)(rec + 0x408), *(int *)(rec + 0x40C));
-            }
-        }
-    }
     return *(volatile short *)0x006302BC != 0 || RACE_INTRO;
 }
 
@@ -668,6 +664,7 @@ static void save_zoom(void)
     if (g_hud) snprintf(v, sizeof v, "%d", g_hud); else strcpy(v, "fit");
     WritePrivateProfileStringA("hud", "scale", v, path);
     WritePrivateProfileStringA("hud", "anchor", g_hud_edges ? "edges" : "center", path);
+    WritePrivateProfileStringA("render", "filter", g_vr_filter ? "smooth" : "sharp", path);
 }
 
 static void vr_subclass(HWND wnd);   /* vrexport.h */
@@ -1043,6 +1040,7 @@ typedef int (__cdecl *PFN_PRESENT)(unsigned int);
 static PFN_PRESENT g_present_orig;
 static void vr_screen_capture(void);   /* vrexport.h */
 static void pad_setup_frame(void);     /* pad.h */
+static void pacediag(double t_in, double t_out);   /* after interp.h */
 static int __cdecl present_hook(unsigned int f)
 {
     pad_setup_frame();
@@ -1092,22 +1090,13 @@ static int __cdecl present_hook(unsigned int f)
                 down[keys[i].vk] = (BYTE)d;
             }
     }
-    if (GetEnvironmentVariableA("MMCDA_SPRLIST", NULL, 0)) {   /* debug: the 2D sprite list, once per 10 s */
-        static DWORD last;
-        if (GetTickCount() - last > 10000) {
-            int i, n = *(volatile int *)0x00504FA4;
-            last = GetTickCount();
-            log_msg("sprlist: %d sprites", n);
-            for (i = 0; i < n && i < 200; i++) {
-                int *e = (int *)(0x00503828 + i * 12);
-                BYTE *rec = (BYTE *)0x0048F378 + e[0] * 0x410;
-                log_msg("  slot %d at %d,%d size %dx%d", e[0], e[1], e[2], *(int *)(rec + 0x408), *(int *)(rec + 0x40C));
-            }
-        }
-    }
     if (RACE_INTRO && g_loadscreen_built && GetEnvironmentVariableA("MMCDA_INTROSHOT", NULL, 0))
         g_shot_force = 1;   /* debug: capture every intro frame (the file ends up with the last) */
-    r = g_present_orig(f | 1);
+    {
+        double t_in = now_ms_qpc();
+        r = g_present_orig(f | 1);
+        pacediag(t_in, now_ms_qpc());
+    }
     {   /* frame-time statistics (logged every 100 presents with MMCDA_LOG=1) */
         static LARGE_INTEGER freq, last;
         static double sum, worst, best = 1e9;
@@ -1136,13 +1125,6 @@ static int __cdecl present_hook(unsigned int f)
     /* release once the new mode has presented a couple of frames: the freeze only hides
        the black gap of the mode switch, so the race loading screen (the starter firing his
        gun) plays as in the original. (It used to wait for the first 3D race frame.) */
-    if (GetEnvironmentVariableA("MMCDA_SEQ", NULL, 0)) {
-        static int fn;
-        if (g_mode_w != 320 && fn < 80)
-            log_msg("seq %d: flag43F1EC=%d raceloop=%d built=%d hscale %.2f", fn++, *(volatile int *)0x0043F1EC,
-                    g_in_race_loop, g_loadscreen_built, g_hscale);
-        if (g_mode_w == 320) fn = 0;
-    }
     /* the race intro's loading screen was on screen (see the hold before the present) */
     if (RACE_INTRO && g_loadscreen_built) {
         g_intro_shown = 1;
@@ -1328,6 +1310,18 @@ static void install_pak_hook(void)
 static int vr_race_intro(void) { return RACE_INTRO; }
 #include "render.h"
 #include "interp.h"
+/* debug (MMCDA_PACEDIAG): race frames that miss a vsync, with where the time went */
+static void pacediag(double t_in, double t_out)
+{
+    static double last_out; static int nlog;
+    if (!g_race_active || !GetEnvironmentVariableA("MMCDA_PACEDIAG", NULL, 0)) { last_out = 0; return; }
+    if (last_out && t_out - last_out > g_present_dt * 1.5 && nlog < 200) {
+        nlog++;
+        log_msg("pacediag: %.2f ms frame (%s): work %.2f ms, present %.2f ms", t_out - last_out,
+                g_in_extra ? "in-between" : "tick", t_in - last_out, t_out - t_in);
+    }
+    last_out = t_out;
+}
 #include "tiles.h"
 #include "debugmenu.h"
 #include "vrexport.h"
