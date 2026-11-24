@@ -3,6 +3,51 @@
 Findings from 2026-11-24, for a track editor whose tracks the game can race on. Addresses are
 in MotorMsh.exe; nothing here contains game data.
 
+## Playing a custom track
+
+Save the map in `Track\` under a slot 9-16 name of its world: `AMAZON9.MAP`, then
+`AMAZONA.MAP` .. `AMAZONG.MAP` (likewise `WEST`, `ICE`, `ATLAN`, `NIGHT`, `CITY`). On the
+track select page (the parrot) it follows that world's own tracks, on a green ball labelled
+9 or A-G, named "Custom 9" .. "Custom G", or by the first line of `Track\<name>.TXT`.
+
+To try it out with a shipped track's layout:
+
+    python -I tools/trackmap.py regen game/Track/Amazon3.map game/Track/AMAZON9.MAP
+
+How MMCDA does it (tools/mmcda/tracks.h, game-level, so both renderers):
+
+- **Track select page.** Page 7's handler (table 0x450ec0) is replaced by a copy of 0x40a620
+  that lists 16 slots: 1-8 as before (unlocked by record, or all with `[race] tracks=all`),
+  9-16 when the map file exists.
+- **Balls 9-16.** The list shows front-end 3D objects: balls 1-8 are objects 0x2a-0x31
+  (`Misc\JUKE01.x`..`JUKE08.x`, each ball 1's mesh with texture `juke000n.bmp` from
+  FRONTEND.tex). Eight records are added to the front-end object list (0x445ae8; table
+  pointer at 0x404461, loop limit at 0x404a33), giving objects 0x39-0x40. Their models
+  `Misc\JUKE09.x`..`JUKE16.x` are written at start-up from the player's JUKE01.x with the
+  texture name changed. The textures are made when loaded (archive lookup 0x42b1f0): ball
+  1's picture with its number filled in from the surrounding pixels, the new label drawn
+  in the balls' style (stroke font in tracks.h), and the palette turned green. Their names
+  borrow JUKE0001's entry in the transparent-texture list (0x61bb58) while they load.
+- **Object table.** Per-object state (0x5050f8, 0x24 bytes each, 57 entries, then other
+  globals) moves to a 65-entry copy: 30 code sites, listed in tools/mmcda/fe_relocs.h
+  (`gen_relocs.py --fe`). The page change at 0x408348 clears it with a count (0x201 dwords),
+  raised to 65 objects, which hides balls 9-16 when the page is left.
+- **Names.** 0x451008 entries for present custom slots point at their names.
+- **Lap records.** Byte 0 of a record is the holder (characters 0-11), 12 = no record,
+  13 = locked. An empty custom slot is set to 12; all zeros would show character 0 holding
+  a 0:00:00 record.
+- **Time-trial ghosts.** Clock.ini keeps 8 ghosts per world and finds a track's at
+  `world * 8 + (slot & 7)` (load 0x409210, save 0x40c8bf), so custom slots would read and
+  overwrite slots 1-8's ghosts. Opening Clock.ini (0x42f0d0) fails for custom slots; both
+  callers then skip the ghost, so custom tracks keep no ghost between sessions.
+- **The parrot's small ball** (mode screen) is 2D sprite `0x96 + (slot & 7)` (0x41101a).
+  There are only 8, and adding sprites means growing the front-end sprite tables, so for
+  custom slots it shows none (sprite id 0x89, which maps to nothing).
+- **Loading screen.** Shows the world's picture, the track name and the record.
+
+Still to do: scripted lifts and traps do not run in slots 9-16 (copying Amazon 1 there
+leaves its lift shut), and a new map's tiles must belong to its world.
+
 ## The game was built for more tracks than it shipped
 
 - **16 slots per world, 8 used.** The map name table (0x43f040, 96 entries) lists
@@ -16,11 +61,9 @@ in MotorMsh.exe; nothing here contains game data.
   names exist (flags at 0x507340, written but never read).
 - **Proven:** a map saved as `Track\AMAZON9.MAP` and selected with the debug track picker
   (`MMCDA_TRACK=72`) loads and races normally.
-- **The menu stops at 8.** The track select page (0x40a620) builds its list from `world + 8`
-  in four places (`lea reg,[eax+8]` at 0x40a6a4, 0x40a6ea, 0x40a8ba, 0x40a8e6) and shows a
-  slot only if its record says it is unlocked. Offering slots 9-16 needs: those four limits,
-  names for the slots, unlocked records, and a menu icon per slot (the list uses sprite
-  `0x2a + n`).
+- **The menu stopped at 8.** The original track select page (0x40a620) builds its list from
+  `world + 8` and shows a slot only if its record byte says it is unlocked. MMCDA now offers
+  slots 9-16 (see "Playing a custom track" below).
 - A seventh row in the trap tables (0x41c270 / 0x41c290) reads the world type from the map
   header and reuses Amazon 1's (type 4) or City-style (type 5) traps: groundwork for maps that
   bring their own world.
@@ -115,6 +158,6 @@ Checks:
 ## Still to find out
 
 - The flag bits in the gate type (8, 16, 64).
-- The menu icon and loading screen picture for slots 9-16 (the loading screen shows a 3D
-  picture per track).
-- Lap records and unlock state for new slots (saved in the game's own files).
+- Scripted features (lifts, traps) for slots 9-16: the trap tables point them at an empty
+  routine; a custom track could name a shipped track whose routines it reuses.
+- A small parrot-hand ball and a time-trial ghost for slots 9-16.

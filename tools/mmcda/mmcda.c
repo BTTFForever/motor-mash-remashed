@@ -1280,6 +1280,8 @@ static HRESULT WINAPI enum_modes_hook(BYTE *desc, void *ctx)
  * EIP = "2D.b", EBP = "SNOW"). We pass only the base name, then run the original.
  */
 typedef int (__cdecl *PFN_TEXCB)(char *name, void *arg, void *out);
+static char *ts_texcb_before(const char *base);
+static void ts_texcb_after(char *keyed);
 static PFN_TEXCB g_texcb_orig;
 
 static int __cdecl texture_callback_hook(char *name, void *arg, void *out)
@@ -1291,7 +1293,9 @@ static int __cdecl texture_callback_hook(char *name, void *arg, void *out)
         if (base != name) log_msg("texture name trimmed: %s -> %s", name, base);
     }
     {
+        char *keyed = ts_texcb_before(base);             /* tracks.h: balls 9-16 see-through like 1-8 */
         int r = g_texcb_orig(base, arg, out);
+        ts_texcb_after(keyed);
         if (r != 0) log_msg("texture load FAILED %d: %s", r, name ? name : "(null)");
         return r;
     }
@@ -1322,6 +1326,8 @@ static void install_texcb_hook(void)
  * (crash with EBP="SNOW", EIP="2D.b"). Reduce any input to the 8-char base name.
  */
 typedef void *(__cdecl *PFN_PAKLOOKUP)(char *name);
+static void ts_pak_before(char *base);
+static void ts_pak_after(void *found);
 static PFN_PAKLOOKUP g_paklookup_orig;
 
 static void *__cdecl pak_lookup_hook(char *name)
@@ -1333,9 +1339,11 @@ static void *__cdecl pak_lookup_hook(char *name)
         if (*p == '\\' || *p == '/' || *p == ':') s = p + 1;
     while (s[n] && s[n] != '.' && n < 8) { base[n] = s[n]; n++; }
     base[n] = 0;
+    ts_pak_before(base);                            /* tracks.h: balls 9-16 are made from ball 1 */
     {
         void *r = g_paklookup_orig(base);
         if (!r) log_msg("archive texture NOT FOUND: %s (%s)", base, name);
+        ts_pak_after(r);
         return r;
     }
 }
@@ -1375,6 +1383,7 @@ static void pacediag(double t_in, double t_out)
 #include "vrexport.h"
 #include "pad.h"
 #include "sixcars.h"
+#include "tracks.h"
 #include "car.h"
 #include "cams.h"
 #include "census.h"
@@ -1422,6 +1431,7 @@ static void install_hooks(void)
     static const BYTE enum_expect[8] = { 0x55, 0x8B, 0xEC, 0x8B, 0x45, 0x08, 0x8B, 0x48 };
     if ((BYTE *)GetModuleHandleA(NULL) != (BYTE *)0x400000) return;
     MAYBE("six", install_sixcars());   /* first: moves tables before other hooks copy any code */
+    MAYBE("tracks", install_tracks()); /* moves the front-end object table: also before other hooks */
     MAYBE("render", install_render());
     if (!skip_feature("window")) {
     log_msg(patch_jmp((BYTE *)0x004052C0, mode_expect, 8, set_display_mode_hook)

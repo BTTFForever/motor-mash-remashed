@@ -2,6 +2,8 @@
 
   python -I trackmap.py dump  <in.map> <out.json>          map -> JSON
   python -I trackmap.py build <in.json> <out.map>          JSON -> map
+  python -I trackmap.py regen <in.map> <out.map>           copy a map with its racing line and gate grid
+                                                           drawn by build (to try a map in a custom slot)
   python -I trackmap.py check <Track folder>               round-trip every map, byte for byte,
                                                            and test a generated line on each
 
@@ -290,6 +292,10 @@ def main():
         json.dump(read(sys.argv[2]), open(sys.argv[3], 'w'))
     elif cmd == 'build':
         open(sys.argv[3], 'wb').write(build(json.load(open(sys.argv[2]))))
+    elif cmd == 'regen':
+        m = read(sys.argv[2])
+        m['line'] = m['gategrid'] = None
+        open(sys.argv[3], 'wb').write(build(m))
     elif cmd == 'check':
         ok = bad = 0
         seen = set()
