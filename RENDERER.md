@@ -161,7 +161,14 @@ Findings that shaped it:
   GPU with a graphics queue; without one the original renderer is used (`MMCDA_NOVULKAN=1` tests
   that path).
 
-**Still to do:** performance, in-game VR (phase 2, on hold), native ports (phase 3: Android,
+**Performance (2026-11-24):** `MMCDA_PERF=1` logs per-stage frame times. A race frame was
+4454 batches (the game alternates textures object by object). Since nothing blends and
+everything is depth-tested, batches with the same state are merged into one indexed draw,
+grouped with a hash table and kept in first-drawn order (so coplanar edges resolve as before;
+pixel-identical). Recording went from 2.06 to 0.39 ms; a frame is ~5.5 ms of work (game 2.9,
+scene transform/lighting 1.7, present 0.9), so 120 and 144 Hz have headroom.
+
+**Still to do:** scene transform/lighting on the GPU or threads (for 240 Hz), in-game VR (phase 2, on hold), native ports (phase 3: Android,
 Quest 3, Linux).
 
 Debug switches (environment variables):

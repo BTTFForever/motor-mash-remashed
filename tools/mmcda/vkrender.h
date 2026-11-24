@@ -16,7 +16,7 @@
     X(vkCreateDescriptorSetLayout) X(vkCreateDescriptorPool) X(vkAllocateDescriptorSets) \
     X(vkFreeDescriptorSets) X(vkUpdateDescriptorSets) X(vkCreateSampler) X(vkCmdBeginRenderPass) \
     X(vkCmdEndRenderPass) X(vkCmdBindPipeline) X(vkCmdBindVertexBuffers) X(vkCmdBindDescriptorSets) \
-    X(vkCmdDraw) X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdPushConstants) X(vkCmdClearAttachments) \
+    X(vkCmdDraw) X(vkCmdDrawIndexed) X(vkCmdBindIndexBuffer) X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdPushConstants) X(vkCmdClearAttachments) \
     X(vkCmdCopyBuffer)
 #define X(f) static PFN_##f f;
 VKR_FUNCS(X)
@@ -46,6 +46,7 @@ typedef struct rbatch {
     int nodepth;                        /* debug: drawn without the depth test */
     int cull;                           /* 1: back faces culled (meshes, as D3DRM) */
 } rbatch;
+typedef struct rmerged { rbatch *b; int first, count; } rmerged;   /* one draw of merged batches */
 
 static struct {
     int ok;
@@ -62,13 +63,15 @@ static struct {
     VkSampler smp_tex, smp_2d, smp_tex_smooth;
     VkBuffer vb, up;
     VkDeviceMemory vb_mem, up_mem;
-    BYTE *vb_ptr, *up_ptr;
+    BYTE *vb_ptr, *up_ptr, *ib_ptr;
+    VkBuffer ib; VkDeviceMemory ib_mem;   /* merged draws: vertex numbers, grouped by state */
     size_t up_used;
     vkt white, overlay, underlay;
     BYTE *under;                 /* the 2D layer at the frame's first Render */
     int under_w, under_h, under_pitch, under_bpp, have_under;
     rvert *v; int nv, cv;
     rbatch *b; int nb, cb;
+    int *ord, cord; rmerged *md; int nmd;   /* merged draws (vr_record) */
 } g_vkr;
 
 static int g_vkr_dec_seen, g_vkr_dec_behind, g_vkr_frames_seen;
@@ -273,6 +276,7 @@ static int vr_init(void)
     g_vkr.pipe3d_cull = vr_pipeline(1, 1);
     g_vkr.pipe2d = vr_pipeline(0, 0);
     if (!vr_buffer(VR_VB_SIZE, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, &g_vkr.vb, &g_vkr.vb_mem, &g_vkr.vb_ptr)) return 0;
+    if (!vr_buffer(VR_VB_SIZE / sizeof(rvert) * 4, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, &g_vkr.ib, &g_vkr.ib_mem, &g_vkr.ib_ptr)) return 0;
     if (!vr_buffer(VR_UP_SIZE, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &g_vkr.up, &g_vkr.up_mem, &g_vkr.up_ptr)) return 0;
     if (!vr_make_targets()) return 0;
     g_vkr.ok = 1;
@@ -711,7 +715,16 @@ static void vr_dump_tree(vframe *f, MAT parent, int d)
 }
 static int g_vkr_renders;
 static int vr_race_intro(void);   /* mmcda.c: RACE_INTRO */
+/* debug (MMCDA_PERF): ms per frame in each stage, averaged */
+static double g_perf_render, g_perf_record, g_perf_tex, g_perf_vcopy, g_perf_upbytes, g_perf_verts, g_perf_batches;
+static void vr_on_render_body(vrmvp *vp, vframe *scene);
 static void vr_on_render(vrmvp *vp, vframe *scene)
+{
+    double t0 = now_ms_qpc();
+    vr_on_render_body(vp, scene);
+    g_perf_render += now_ms_qpc() - t0;
+}
+static void vr_on_render_body(vrmvp *vp, vframe *scene)
 {
     vrmvp intro;
     g_vkr_renders++;
@@ -798,13 +811,43 @@ static void vr_end_frame(void)
 }
 
 /* called by vkp_present between acquire and submit; the overlay image already holds the 2D frame */
+/* same state (pipeline, viewport, fog colour, texture): the batches can share one draw */
+static int vr_batch_key_cmp(const rbatch *a, const rbatch *b)
+{
+    if (a->nodepth != b->nodepth) return a->nodepth - b->nodepth;
+    if (a->cull != b->cull) return a->cull - b->cull;
+    if (a->vx != b->vx) return a->vx < b->vx ? -1 : 1;
+    if (a->vy != b->vy) return a->vy < b->vy ? -1 : 1;
+    if (a->vw != b->vw) return a->vw < b->vw ? -1 : 1;
+    if (a->vh != b->vh) return a->vh < b->vh ? -1 : 1;
+    if (a->color != b->color) return a->color < b->color ? -1 : 1;
+    if (a->tex != b->tex) return (UINT_PTR)a->tex < (UINT_PTR)b->tex ? -1 : 1;
+    return 0;
+}
+static void vr_batch_scissor(const rbatch *b, VkRect2D *sc, int dx, int dy, double kx, double ky)
+{
+    sc->offset.x = dx + (int)(b->vx * kx); sc->offset.y = dy + (int)(b->vy * ky);
+    sc->extent.width = (uint32_t)(b->vw * kx + 0.5); sc->extent.height = (uint32_t)(b->vh * ky + 0.5);
+    if (sc->offset.x < 0) sc->offset.x = 0;
+    if (sc->offset.y < 0) sc->offset.y = 0;
+    if (sc->offset.x + sc->extent.width > g_vk.extent.width) sc->extent.width = g_vk.extent.width - sc->offset.x;
+    if (sc->offset.y + sc->extent.height > g_vk.extent.height) sc->extent.height = g_vk.extent.height - sc->offset.y;
+}
+
+static void vr_record_body(VkCommandBuffer cmd, uint32_t idx, int dx, int dy, int dw, int dh, int mode_w, int mode_h);
 static void vr_record(VkCommandBuffer cmd, uint32_t idx, int dx, int dy, int dw, int dh, int mode_w, int mode_h)
+{
+    double t0 = now_ms_qpc();
+    vr_record_body(cmd, idx, dx, dy, dw, dh, mode_w, mode_h);
+    g_perf_record += now_ms_qpc() - t0;
+}
+static void vr_record_body(VkCommandBuffer cmd, uint32_t idx, int dx, int dy, int dw, int dh, int mode_w, int mode_h)
 {
     VkRenderPassBeginInfo rb = { VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
     VkClearValue cv[2];
     VkDeviceSize zero = 0;
     double kx = (double)dw / mode_w, ky = (double)dh / mode_h;
-    int i, n2d, pass;
+    int i, n2d;
     rvert *ov;
     /* texture uploads first (outside the render pass) */
     g_vkr.up_used = 0;
@@ -817,7 +860,12 @@ static void vr_record(VkCommandBuffer cmd, uint32_t idx, int dx, int dy, int dw,
         vr_upload(cmd, &g_vkr.white, 0);
         vr_set_texture_desc(&g_vkr.white, g_vkr.smp_tex);
     }
-    for (i = 0; i < g_vkr.nb; i++) if (!g_vkr.b[i].clear) vr_texture(cmd, g_vkr.b[i].tex);
+    {
+        double t0 = now_ms_qpc();
+        size_t up0 = g_vkr.up_used;
+        for (i = 0; i < g_vkr.nb; i++) if (!g_vkr.b[i].clear) vr_texture(cmd, g_vkr.b[i].tex);
+        g_perf_tex += now_ms_qpc() - t0; g_perf_upbytes += g_vkr.up_used - up0;
+    }
     /* the 2D layer: a quad over the whole game picture */
     n2d = g_vkr.nv;
     if ((ov = vr_alloc(6))) {
@@ -828,7 +876,62 @@ static void vr_record(VkCommandBuffer cmd, uint32_t idx, int dx, int dy, int dw,
             ov[i].col = 0xFFFFFFFF; ov[i].fog = 1;
         }
     }
-    memcpy(g_vkr.vb_ptr, g_vkr.v, g_vkr.nv * sizeof(rvert));
+    {   /* Merge: nothing in the game blends (transparency is alpha-tested) and everything is
+           depth-tested, so draw order does not matter. Batches with the same texture and state
+           become one indexed draw (vertex numbers listed group by group). ~4500 batches -> a few
+           hundred draws. */
+        double t0 = now_ms_qpc();
+        DWORD *ib = (DWORD *)g_vkr.ib_ptr;
+        int nd = 0, j, out = 0;
+        memcpy(g_vkr.vb_ptr, g_vkr.v, g_vkr.nv * sizeof(rvert));   /* vertices stay in place */
+        if (g_vkr.cord < g_vkr.nb) {
+            g_vkr.cord = g_vkr.nb + 256;
+            g_vkr.ord = (int *)realloc(g_vkr.ord, g_vkr.cord * sizeof(int));
+            g_vkr.md = (rmerged *)realloc(g_vkr.md, g_vkr.cord * sizeof(rmerged));
+        }
+        /* group with a hash table (one pass) */
+        {
+            enum { HB = 2048 };
+            static int head[HB], tail[HB], gfirst[HB], ngr;
+            static int slot_of[HB];
+            int *next = g_vkr.ord;               /* per batch: next batch in the same group */
+            int gi, h;
+            for (h = 0; h < ngr; h++) head[slot_of[h]] = -1;
+            if (!ngr) for (h = 0; h < HB; h++) head[h] = -1;
+            ngr = 0;
+            for (i = 0; i < g_vkr.nb; i++) {
+                rbatch *bb = &g_vkr.b[i];
+                DWORD k;
+                if (bb->clear || !bb->count) continue;
+                k = (DWORD)(UINT_PTR)bb->tex * 2654435761u ^ (DWORD)bb->vx * 31 ^ (DWORD)bb->vy * 131 ^ (DWORD)bb->vw * 7 ^
+                    (DWORD)bb->vh * 17 ^ bb->color * 3 ^ (DWORD)bb->cull * 0x9E37 ^ (DWORD)bb->nodepth * 0x7F4A;
+                for (h = (k ^ (k >> 15)) & (HB - 1); head[h] >= 0 && vr_batch_key_cmp(&g_vkr.b[head[h]], bb); h = (h + 1) & (HB - 1)) ;
+                if (head[h] < 0) {
+                    if (ngr >= HB / 2) continue;     /* (never: far fewer distinct states) */
+                    head[h] = tail[h] = i; slot_of[ngr] = h; gfirst[ngr++] = i;
+                } else { next[tail[h]] = i; tail[h] = i; }
+                next[i] = -1;
+                nd++;
+            }
+            /* groups stay in the order the game first drew them: surfaces that overlap at the same
+               depth (road edges, kerbs) resolve as in the original, where the later one wins */
+            g_vkr.nmd = 0;
+            for (gi = 0; gi < ngr; gi++) {
+                int bi = gfirst[gi];
+                g_vkr.md[g_vkr.nmd].b = &g_vkr.b[bi]; g_vkr.md[g_vkr.nmd].first = out; g_vkr.md[g_vkr.nmd].count = 0;
+                for (; bi >= 0; bi = next[bi]) {
+                    rbatch *bb = &g_vkr.b[bi];
+                    int v0 = bb->first, c, n = bb->count;
+                    DWORD *dst = ib + out;
+                    for (c = 0; c < n; c++) dst[c] = v0 + c;
+                    out += n; g_vkr.md[g_vkr.nmd].count += n;
+                }
+                g_vkr.nmd++;
+            }
+            (void)j;
+        }
+        g_perf_vcopy += now_ms_qpc() - t0; g_perf_verts += g_vkr.nv; g_perf_batches += g_vkr.nmd;
+    }
     cv[0].color.float32[0] = cv[0].color.float32[1] = cv[0].color.float32[2] = 0; cv[0].color.float32[3] = 1;
     {
         static int dbg = -1, frames;
@@ -859,56 +962,72 @@ static void vr_record(VkCommandBuffer cmd, uint32_t idx, int dx, int dy, int dw,
     rb.clearValueCount = 2; rb.pClearValues = cv;
     vkCmdBeginRenderPass(cmd, &rb, VK_SUBPASS_CONTENTS_INLINE);
     vkCmdBindVertexBuffers(cmd, 0, 1, &g_vkr.vb, &zero);
-    for (pass = 0; pass < 2; pass++)
+    vkCmdBindIndexBuffer(cmd, g_vkr.ib, 0, VK_INDEX_TYPE_UINT32);
+    /* clears first (every viewport), then the 2D underlay, then the merged 3D draws */
     for (i = 0; i < g_vkr.nb; i++) {
         rbatch *b = &g_vkr.b[i];
         VkRect2D sc;
-        VkViewport vpt;
-        if (pass == 1 && i == 0 && g_vk.use_under && g_vkr.underlay.set && ov) {
-            /* the 2D that was there before the 3D (e.g. the menu background), after the clears */
-            VkViewport uv = { (float)dx, (float)dy, (float)dw, (float)dh, 0, 1 };
-            VkRect2D us = { { dx, dy }, { (uint32_t)dw, (uint32_t)dh } };
-            float fogc[4] = { 0, 0, 0, 1 };
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_vkr.pipe2d);
-            vkCmdSetViewport(cmd, 0, 1, &uv);
-            vkCmdSetScissor(cmd, 0, 1, &us);
-            vkCmdPushConstants(cmd, g_vkr.layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16, fogc);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_vkr.layout, 0, 1, &g_vkr.underlay.set, 0, NULL);
-            vkCmdDraw(cmd, 6, 1, n2d, 0);
-        }
-        if ((pass == 0) != (b->clear != 0)) continue;   /* clears first, then the 3D */
-        sc.offset.x = dx + (int)(b->vx * kx); sc.offset.y = dy + (int)(b->vy * ky);
-        sc.extent.width = (uint32_t)(b->vw * kx + 0.5); sc.extent.height = (uint32_t)(b->vh * ky + 0.5);
-        if (sc.offset.x < 0) sc.offset.x = 0;
-        if (sc.offset.y < 0) sc.offset.y = 0;
-        if (sc.offset.x + sc.extent.width > g_vk.extent.width) sc.extent.width = g_vk.extent.width - sc.offset.x;
-        if (sc.offset.y + sc.extent.height > g_vk.extent.height) sc.extent.height = g_vk.extent.height - sc.offset.y;
-        if (b->clear) {
-            VkClearAttachment ca[2];
-            VkClearRect cr;
-            ca[0].aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; ca[0].colorAttachment = 0;
-            ca[0].clearValue.color.float32[0] = ((b->color >> 16) & 255) / 255.f;
-            ca[0].clearValue.color.float32[1] = ((b->color >> 8) & 255) / 255.f;
-            ca[0].clearValue.color.float32[2] = (b->color & 255) / 255.f;
-            ca[0].clearValue.color.float32[3] = 1;
-            ca[1].aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT; ca[1].clearValue.depthStencil.depth = 1;
-            cr.rect = sc; cr.baseArrayLayer = 0; cr.layerCount = 1;
-            if (sc.extent.width && sc.extent.height) vkCmdClearAttachments(cmd, 2, ca, 1, &cr);
-            continue;
-        }
-        if (!b->count || !sc.extent.width || !sc.extent.height) continue;
-        {
+        VkClearAttachment ca[2];
+        VkClearRect cr;
+        if (!b->clear) continue;
+        vr_batch_scissor(b, &sc, dx, dy, kx, ky);
+        ca[0].aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; ca[0].colorAttachment = 0;
+        ca[0].clearValue.color.float32[0] = ((b->color >> 16) & 255) / 255.f;
+        ca[0].clearValue.color.float32[1] = ((b->color >> 8) & 255) / 255.f;
+        ca[0].clearValue.color.float32[2] = (b->color & 255) / 255.f;
+        ca[0].clearValue.color.float32[3] = 1;
+        ca[1].aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT; ca[1].clearValue.depthStencil.depth = 1;
+        cr.rect = sc; cr.baseArrayLayer = 0; cr.layerCount = 1;
+        if (sc.extent.width && sc.extent.height) vkCmdClearAttachments(cmd, 2, ca, 1, &cr);
+    }
+    if (g_vk.use_under && g_vkr.underlay.set && ov) {
+        /* the 2D that was there before the 3D (e.g. the menu background), after the clears */
+        VkViewport uv = { (float)dx, (float)dy, (float)dw, (float)dh, 0, 1 };
+        VkRect2D us = { { dx, dy }, { (uint32_t)dw, (uint32_t)dh } };
+        float fogc[4] = { 0, 0, 0, 1 };
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_vkr.pipe2d);
+        vkCmdSetViewport(cmd, 0, 1, &uv);
+        vkCmdSetScissor(cmd, 0, 1, &us);
+        vkCmdPushConstants(cmd, g_vkr.layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16, fogc);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_vkr.layout, 0, 1, &g_vkr.underlay.set, 0, NULL);
+        vkCmdDraw(cmd, 6, 1, n2d, 0);
+    }
+    {   /* the merged draws, re-binding only what changes */
+        VkPipeline cur_pipe = VK_NULL_HANDLE;
+        VkDescriptorSet cur_set = VK_NULL_HANDLE;
+        rbatch *cur_vp = NULL;
+        DWORD cur_col = 0;
+        int have_col = 0;
+        for (i = 0; i < g_vkr.nmd; i++) {
+            rbatch *b = g_vkr.md[i].b;
+            VkRect2D sc;
+            VkPipeline pp = b->nodepth ? g_vkr.pipe2d : b->cull ? g_vkr.pipe3d_cull : g_vkr.pipe3d;
             vkt *k = (b->tex && b->tex->gpu && ((vkt *)b->tex->gpu)->set) ? (vkt *)b->tex->gpu : &g_vkr.white;
-            float fogc[4] = { ((b->color >> 16) & 255) / 255.f, ((b->color >> 8) & 255) / 255.f, (b->color & 255) / 255.f, 1 };
-            vpt.x = (float)(dx + b->vx * kx); vpt.y = (float)(dy + b->vy * ky);
-            vpt.width = (float)(b->vw * kx); vpt.height = (float)(b->vh * ky);
-            vpt.minDepth = 0; vpt.maxDepth = 1;
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, b->nodepth ? g_vkr.pipe2d : b->cull ? g_vkr.pipe3d_cull : g_vkr.pipe3d);
-            vkCmdSetViewport(cmd, 0, 1, &vpt);
-            vkCmdSetScissor(cmd, 0, 1, &sc);
-            vkCmdPushConstants(cmd, g_vkr.layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16, fogc);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_vkr.layout, 0, 1, &k->set, 0, NULL);
-            vkCmdDraw(cmd, b->count, 1, b->first, 0);
+            vr_batch_scissor(b, &sc, dx, dy, kx, ky);
+            if (!sc.extent.width || !sc.extent.height) continue;
+            if (pp != cur_pipe) {
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pp);
+                cur_pipe = pp; cur_vp = NULL; have_col = 0; cur_set = VK_NULL_HANDLE;
+            }
+            if (!cur_vp || cur_vp->vx != b->vx || cur_vp->vy != b->vy || cur_vp->vw != b->vw || cur_vp->vh != b->vh) {
+                VkViewport vpt;
+                vpt.x = (float)(dx + b->vx * kx); vpt.y = (float)(dy + b->vy * ky);
+                vpt.width = (float)(b->vw * kx); vpt.height = (float)(b->vh * ky);
+                vpt.minDepth = 0; vpt.maxDepth = 1;
+                vkCmdSetViewport(cmd, 0, 1, &vpt);
+                vkCmdSetScissor(cmd, 0, 1, &sc);
+                cur_vp = b;
+            }
+            if (!have_col || cur_col != b->color) {
+                float fogc[4] = { ((b->color >> 16) & 255) / 255.f, ((b->color >> 8) & 255) / 255.f, (b->color & 255) / 255.f, 1 };
+                vkCmdPushConstants(cmd, g_vkr.layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16, fogc);
+                cur_col = b->color; have_col = 1;
+            }
+            if (k->set != cur_set) {
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_vkr.layout, 0, 1, &k->set, 0, NULL);
+                cur_set = k->set;
+            }
+            vkCmdDrawIndexed(cmd, g_vkr.md[i].count, 1, g_vkr.md[i].first, 0, 0);
         }
     }
     if (ov && g_vkr.overlay.set) {

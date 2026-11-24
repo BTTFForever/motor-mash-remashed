@@ -397,7 +397,33 @@ static void vr_end_frame(void);
 /* present a game frame: the 2D layer (bits/pitch, 8-bit with palette or RGB565) over the 3D
    batches recorded since the last present. (aw, ah) is the aspect the picture should have on
    screen (e.g. 4:3 for 320x200). */
+static void vkp_present_body(const BYTE *bits, int w, int h, int pitch, int bpp, const DWORD *pal, int aw, int ah);
+static double g_perf_render, g_perf_record, g_perf_tex, g_perf_vcopy, g_perf_upbytes, g_perf_verts, g_perf_batches;
 static void vkp_present(const BYTE *bits, int w, int h, int pitch, int bpp, const DWORD *pal, int aw, int ah)
+{
+    static double sum_total, sum_present, sum_wait, sum_render, sum_record, last;
+    static int n;
+    double t0 = now_ms_qpc(), t1;
+    vkp_present_body(bits, w, h, pitch, bpp, pal, aw, ah);
+    t1 = now_ms_qpc();
+    if (!GetEnvironmentVariableA("MMCDA_PERF", NULL, 0)) { g_perf_render = g_perf_record = 0; return; }
+    if (last > 0 && t1 - last < 100) {
+        sum_total += t1 - last; sum_present += t1 - t0; sum_wait += g_vk.t_fence + g_vk.t_acquire + g_vk.t_queue;
+        sum_render += g_perf_render; sum_record += g_perf_record; n++;
+    }
+    g_perf_render = g_perf_record = 0;
+    last = t1;
+    if (n == 240) {
+        log_msg("perf %dx%d: frame %.2f ms = game %.2f + scene T&L %.2f + present %.2f (2D convert/upload %.2f, record %.2f, waiting %.2f)",
+                w, h, sum_total / n, (sum_total - sum_present - sum_render) / n, sum_render / n, sum_present / n,
+                (sum_present - sum_wait - sum_record) / n, sum_record / n, sum_wait / n);
+        log_msg("perf   record: textures %.2f ms (%.0f KB uploaded/frame), vertex copy %.2f ms (%.0f verts, %.0f batches/frame)",
+                g_perf_tex / n, g_perf_upbytes / n / 1024, g_perf_vcopy / n, g_perf_verts / n, g_perf_batches / n);
+        g_perf_tex = g_perf_vcopy = g_perf_upbytes = g_perf_verts = g_perf_batches = 0;
+        sum_total = sum_present = sum_wait = sum_render = sum_record = 0; n = 0;
+    }
+}
+static void vkp_present_body(const BYTE *bits, int w, int h, int pitch, int bpp, const DWORD *pal, int aw, int ah)
 {
     uint32_t idx;
     VkResult r;
