@@ -1402,6 +1402,18 @@ static void install_loadscreen_hook(void)
     FlushInstructionCache(GetCurrentProcess(), site, 5);
 }
 
+/* debug (MMCDA_SKIP=six,camera,...): leave features out, to find which one causes a problem */
+static int skip_feature(const char *name)
+{
+    char v[256], *p;
+    size_t n = strlen(name);
+    if (!GetEnvironmentVariableA("MMCDA_SKIP", v, sizeof v)) return 0;
+    for (p = v; (p = strstr(p, name)) != NULL; p += n)
+        if ((p == v || p[-1] == ',') && (p[n] == 0 || p[n] == ',')) { log_msg("skip: %s", name); return 1; }
+    return 0;
+}
+#define MAYBE(name, call) do { if (!skip_feature(name)) call; } while (0)
+
 static void install_hooks(void)
 {
     install_texcb_hook();
@@ -1409,22 +1421,24 @@ static void install_hooks(void)
     static const BYTE mode_expect[8] = { 0x55, 0x8B, 0xEC, 0x8B, 0x55, 0x10, 0x8B, 0x45 };
     static const BYTE enum_expect[8] = { 0x55, 0x8B, 0xEC, 0x8B, 0x45, 0x08, 0x8B, 0x48 };
     if ((BYTE *)GetModuleHandleA(NULL) != (BYTE *)0x400000) return;
-    install_sixcars();   /* first: moves tables before other hooks copy any code */
-    install_render();
+    MAYBE("six", install_sixcars());   /* first: moves tables before other hooks copy any code */
+    MAYBE("render", install_render());
+    if (!skip_feature("window")) {
     log_msg(patch_jmp((BYTE *)0x004052C0, mode_expect, 8, set_display_mode_hook)
             ? "window-fit hook installed" : "mode site mismatch, window-fit hook skipped");
     log_msg(patch_jmp((BYTE *)0x00406A40, enum_expect, 8, enum_modes_hook)
             ? "mode-list hook installed" : "enum site mismatch, mode-list hook skipped");
-    install_fov_hook();
-    install_camera();
-    install_transition_hooks();
-    install_loadscreen_hook();
-    install_interp();
-    install_tiles();
-    install_debugmenu();
-    install_vrexport();
-    install_pad();
-    install_car();
+    }
+    MAYBE("fov", install_fov_hook());
+    MAYBE("camera", install_camera());
+    MAYBE("transition", install_transition_hooks());
+    MAYBE("loadscreen", install_loadscreen_hook());
+    MAYBE("interp", install_interp());
+    MAYBE("tiles", install_tiles());
+    MAYBE("debugmenu", install_debugmenu());
+    MAYBE("vrexport", install_vrexport());
+    MAYBE("pad", install_pad());
+    MAYBE("car", install_car());
     install_census();   /* last: wraps vtables the hooks above may also patch */
 }
 

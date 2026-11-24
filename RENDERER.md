@@ -180,3 +180,5 @@ Debug switches (environment variables):
   move without being interpolated
 - `MMCDA_INPUTLOG=1`: log keys/clicks in the game window (to record a menu path)
 - `MMCDA_VDDTRACE=1`, `MMCDA_VRMTRACE=1`: DirectDraw / D3DRM call traces; `MMCDA_CENSUS=1`: call census
+- `MMCDA_SKIP=six,render,window,fov,camera,transition,loadscreen,interp,tiles,debugmenu,vrexport,pad,car`:
+  leave those features out at start, to bisect a problem (the two crash fixes always stay on)
