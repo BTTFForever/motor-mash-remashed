@@ -180,6 +180,7 @@ struct fglyph { int w, h, adv; BYTE *px; DWORD pal[16 + 240]; };
 static struct fglyph g_font[128];
 static int g_font_ready, g_font_bpp, g_font_h;
 
+static DWORD conv_px(DWORD v, int from, int to);
 static void font_capture(void)
 {
     int c, n = 0;
@@ -210,6 +211,31 @@ static void font_capture(void)
     g_font[' '].adv = WIDTH_OF(' ') > 0 ? WIDTH_OF(' ') : 5;
     g_font_ready = n > 20;
     log_msg("debug menu: captured %d font glyphs (%d bpp, height %d)", n, g_font_bpp, g_font_h);
+    if (GetEnvironmentVariableA("MMCDA_SPRDUMP", NULL, 0)) {   /* debug: the big loaded sprites, as sprNNN.bin */
+        int id;
+        for (id = 0; id < 0x1AB; id++) {
+            int slot = LOADED_SPRITE[id], w, h, x, y, packed;
+            BYTE *rec, *hdr, *src;
+            char path[MAX_PATH];
+            FILE *f;
+            if (slot < 0) continue;
+            rec = SPR_REC(slot); hdr = *(BYTE **)rec; src = *(BYTE **)(rec + 4);
+            w = *(int *)(rec + 0x408); h = *(int *)(rec + 0x40C);
+            if (!hdr || !src || w < 64 || h < 64) continue;
+            log_msg("sprite %d: slot %d, %dx%d, %d bit", id, slot, w, h, hdr[0xE]);
+            snprintf(path, sizeof path, "%sspr%03d.bin", g_home, id);
+            if (!(f = fopen(path, "wb"))) continue;
+            packed = hdr[0xE] <= 0x10;
+            fwrite(&w, 4, 1, f); fwrite(&h, 4, 1, f);
+            for (y = 0; y < h; y++)
+                for (x = 0; x < w; x++) {
+                    int i = y * w + x, c = packed ? ((x & 1) ? src[i / 2] & 0xF : (src[i / 2] >> 4) & 0xF) : src[i];
+                    DWORD v = c ? conv_px(((DWORD *)(rec + 8))[c], g_font_bpp, 32) : 0xFF00FF;
+                    fwrite(&v, 4, 1, f);
+                }
+            fclose(f);
+        }
+    }
 }
 
 /* paint into a locked surface; colours converted between 16-bit 565 and 32-bit if needed */

@@ -50,6 +50,16 @@ static int player_pose(float *x, float *y, float *z, float *yaw)
         MAT4 m;
         if (!car_is_player1(car) || !body || g_fr_gettransform(body, m) != 0) continue;
         *x = m[3][0] + ORIGIN_X; *y = m[3][1]; *z = m[3][2] + ORIGIN_Z;
+        if (g_render_vulkan && GetEnvironmentVariableA("MMCDA_VKDEBUG", NULL, 0)) {
+            static int n;
+            if (n++ % 200 == 0) {
+                vframe *f = (vframe *)body;
+                int d;
+                for (d = 0; f && d < 5; f = f->parent, d++)
+                    log_msg("cams: body chain %d: %p '%s' local t(%.1f %.1f %.1f) kids %d vis %d", d, f, f->o.name,
+                            f->m[3][0], f->m[3][1], f->m[3][2], f->kids.n, f->visuals.n);
+            }
+        }
         if (g_cc[i].ok && g_cc[i].frame == body) {
             /* the model was shifted so its middle sits on the pivot: the frame origin moved,
                so aim at where the mesh centre (model cx, 0, cz) ends up */

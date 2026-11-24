@@ -220,6 +220,8 @@ static DWORD WINAPI pad_thread(LPVOID p)
 /* ---- gamepad -> game keys (keyboard-poll hook, once per game loop) ------------------ */
 static volatile int g_pad_setup_open;
 static volatile int g_pad_esc_pulse;
+static int g_cal_inpage;                 /* opened from the Calibrate page, which stays up underneath */
+static int g_cal_leave;                  /* closing: leave the Calibrate page when no key is held */
 static volatile DWORD g_joy_race_poll;       /* last time a race read Joystick 1 */
 static int pad_inject(void)
 {
@@ -235,7 +237,26 @@ static int pad_inject(void)
         log_msg("pad: offering the SDL controller as the game's Joystick 1");
     }
     if (g_pad_setup_open) { memset(k, 0, 256); return 1; }      /* setup screen owns the input */
-    if (g_pad_esc_pulse > 0) { g_pad_esc_pulse--; memset(k, 0, 256); if (g_pad_esc_pulse == 1) k[0x01] = 0x80; return 1; }
+    if (g_cal_leave) {
+        /* the key that closed the setup screen must not reach the options page as well */
+        int i, held = g_pad.button[0] || g_pad.button[1] || g_pad.button[6];
+        for (i = 0; i < 256; i++) if (k[i] & 0x80) held = 1;
+        memset(k, 0, 256);
+        if (!held) { *(volatile int *)0x005072F4 = 2; g_cal_leave = 0; }   /* as the page did after joy.cpl */
+        return 1;
+    }
+    if (g_pad_esc_pulse > 0) {
+        /* first wait for the key that closed the setup screen to be let go, so it does not
+           reach the page as well; then one Esc of our own */
+        int i, held = 0;
+        for (i = 0; i < 256; i++) if (k[i] & 0x80) held = 1;
+        if (g_pad.button[0] || g_pad.button[1] || g_pad.button[6]) held = 1;   /* A / B / Start */
+        memset(k, 0, 256);
+        if (held && g_pad_esc_pulse == 3) return 1;
+        g_pad_esc_pulse--;
+        if (g_pad_esc_pulse == 1) k[0x01] = 0x80;
+        return 1;
+    }
     if (g_pad.active < 0) return 0;
     /* The controller drives only through the game's Joystick 1 (joyread_hook): the purple
        and pink keyboard choices stay keyboard-only, as in the original. The menus read
@@ -297,19 +318,125 @@ static int pad_capture(const unsigned char *btn0, const float *axis0)
     return 0;
 }
 
+/* A copy of a loaded sprite in 32-bit RGB (0 = transparent): the page background (slot 1,
+   320x256, reloaded by the game for each page) and the logo, taken when Calibrate is chosen,
+   while the options page is still loaded. */
+struct spcopy { int w, h; DWORD *px; };
+static struct spcopy g_page_bg, g_page_logo;
+static void sprite_copy(struct spcopy *c, int slot)
+{
+    BYTE *rec, *hdr, *src;
+    int w, h, x, y, packed;
+    if (slot < 0) return;
+    rec = SPR_REC(slot); hdr = *(BYTE **)rec; src = *(BYTE **)(rec + 4);
+    w = *(int *)(rec + 0x408); h = *(int *)(rec + 0x40C);
+    if (!hdr || !src || w <= 0 || h <= 0 || w > 640 || h > 512) return;
+    free(c->px);
+    if (!(c->px = (DWORD *)malloc((size_t)w * h * 4))) { c->w = c->h = 0; return; }
+    packed = hdr[0xE] <= 0x10;
+    for (y = 0; y < h; y++)
+        for (x = 0; x < w; x++) {
+            int i = y * w + x, k = packed ? ((x & 1) ? src[i / 2] & 0xF : (src[i / 2] >> 4) & 0xF) : src[i];
+            DWORD v = k ? conv_px(((DWORD *)(rec + 8))[k], *(volatile int *)0x00504DA0, 32) & 0xFFFFFF : 0;
+            c->px[i] = k ? (v | 0xFF000000u) : 0;
+        }
+    c->w = w; c->h = h;
+}
+
+static void sprite_draw(struct lockinfo *lk, const struct spcopy *c, int x0, int y0)
+{
+    int x, y;
+    for (y = 0; y < c->h; y++)
+        for (x = 0; x < c->w; x++) {
+            DWORD v = c->px[y * c->w + x];
+            if (v) put_px(lk, x0 + x, y0 + y, conv_px(v & 0xFFFFFF, 32, lk->bpp));
+        }
+}
+
+/* text at any size: x, y in 320x240 menu units, sc = menu units per font pixel */
+static float g_ui_k;   /* back-buffer pixels per menu unit */
+static int ui_text_w(const char *s, float sc)
+{
+    float w = 0;
+    for (; *s; s++) {
+        struct fglyph *G = (BYTE)*s < 128 ? &g_font[(BYTE)*s] : NULL;
+        w += sc * (G && G->adv > 0 ? G->adv : (G && G->w ? G->w + 1 : 5));
+    }
+    return (int)(w + 0.5f);
+}
+
+static void ui_text(struct lockinfo *lk, float x, float y, const char *s, float sc)
+{
+    float k = g_ui_k * sc;                       /* back-buffer pixels per font pixel */
+    for (; *s; s++) {
+        struct fglyph *G = (BYTE)*s < 128 ? &g_font[(BYTE)*s] : NULL;
+        if (G && G->px) {
+            int x0 = (int)(x * g_ui_k), y0 = (int)(y * g_ui_k);
+            int dw = (int)(G->w * k + 0.5f), dh = (int)(G->h * k + 0.5f), dx, dy;
+            for (dy = 0; dy < dh; dy++)
+                for (dx = 0; dx < dw; dx++) {
+                    int gx = (int)(dx / k), gy = (int)(dy / k);
+                    BYTE i;
+                    if (gx >= G->w || gy >= G->h || !(i = G->px[gy * G->w + gx])) continue;
+                    put_px(lk, x0 + dx, y0 + dy, conv_px(G->pal[i], g_font_bpp, lk->bpp));
+                }
+        }
+        x += sc * (G && G->adv > 0 ? G->adv : (G && G->w ? G->w + 1 : 5));
+    }
+}
+
+/* the menus' red ball marker: a shaded sphere, r in menu units */
+static void ui_ball(struct lockinfo *lk, float cx, float cy, float r)
+{
+    int bx0 = (int)(cx * g_ui_k), by0 = (int)(cy * g_ui_k), rad = (int)(r * g_ui_k + 0.5f), x, y;
+    for (y = -rad; y <= rad; y++)
+        for (x = -rad; x <= rad; x++) {
+            float d = (float)(x * x + y * y) / (rad * rad), hl;
+            int rr, gg, bb;
+            if (d > 1) continue;
+            hl = (float)((x + rad / 3) * (x + rad / 3) + (y + rad / 3) * (y + rad / 3)) / (rad * rad);   /* highlight, top left */
+            rr = (int)(230 - 120 * d); gg = bb = (int)(30 - 20 * d);
+            if (hl < 0.12f) { rr = 255; gg = bb = (int)(255 - hl * 1500); if (gg < 60) gg = bb = 60; }
+            put_px(lk, bx0 + x, by0 + y, conv_px(((DWORD)rr << 16) | (gg << 8) | bb, 32, lk->bpp));
+        }
+}
+
+/* Laid out like the game's option pages (e.g. Display): the logo at the top, rows with the
+   red ball on the selected one and values on the right, the page's name in a box below. */
 static void setup_draw(struct lockinfo *lk, const BYTE *bg, int sel, int capturing)
 {
-    int S = g_txt_scale, r, y0 = 24, step = 13, i;
+    /* the menus run at 320x240 (one font pixel per pixel): the rows scroll, 8 at a time */
+    /* over the Calibrate page the rows start below its joystick icon: 7 at a time */
+    const int VIS = bg ? 8 : 7;
+    const float y0 = bg ? 62 : 82, step = 16, sc = 1, vx = 300;
+    static int top;
+    int r, i, bpp8 = lk->bpp / 8;
     char v[64];
-    for (i = 0; i < lk->h; i++) memcpy(lk->bits + i * lk->pitch, bg + (size_t)i * lk->pitch, (size_t)lk->w * lk->bpp / 8);
-    darken(lk, 0, 0, lk->w, lk->h);
-    darken(lk, 8 * S, 4 * S, 312 * S, 236 * S);
-    g_txt_lock = lk;
-    buf_text(16, 6, "CONTROLLER SETUP");
-    for (r = 0; r < ROW_COUNT; r++) {
-        int y = y0 + r * step;
+    if (sel < top) top = sel;
+    if (sel >= top + VIS) top = sel - VIS + 1;
+    if (top > ROW_COUNT - VIS) top = ROW_COUNT - VIS;
+    if (top < 0) top = 0;
+    g_ui_k = lk->h / 240.0f;
+    if (!bg) ;   /* over the game's Calibrate page as it is */
+    else if (g_page_bg.px && g_page_bg.w == 320 && lk->w == 320) {   /* the options page's own background and logo */
+        int y;
+        for (y = 0; y < lk->h && y < g_page_bg.h; y++) {
+            int x;
+            for (x = 0; x < 320; x++) put_px(lk, x, y, conv_px(g_page_bg.px[y * 320 + x] & 0xFFFFFF, 32, lk->bpp));
+        }
+        if (g_page_logo.px) sprite_draw(lk, &g_page_logo, 95, -2);
+    } else {   /* the menu behind, dimmed; the logo kept as it is */
+        int lx0 = (int)(92 * g_ui_k), lx1 = (int)(228 * g_ui_k), ly1 = (int)(60 * g_ui_k);
+        for (i = 0; i < lk->h; i++) memcpy(lk->bits + i * lk->pitch, bg + (size_t)i * lk->pitch, (size_t)lk->w * bpp8);
+        darken(lk, 0, 0, lk->w, ly1);
+        darken(lk, 0, ly1, lk->w, lk->h);
+        for (i = 0; i < ly1 && i < lk->h; i++)
+            memcpy(lk->bits + i * lk->pitch + lx0 * bpp8, bg + (size_t)i * lk->pitch + lx0 * bpp8, (size_t)(lx1 - lx0) * bpp8);
+    }
+    for (r = top; r < top + VIS && r < ROW_COUNT; r++) {
+        float y = y0 + (r - top) * step;
         const char *label = "", *val = "";
-        if (r == sel) buf_text(8, y, ">");
+        if (r == sel) ui_ball(lk, 14, y + 7, 4);
         if (r == ROW_DEVICE) {
             label = "Device";
             val = g_pad.active >= 0 ? g_pad.names[g_pad.active] : (g_pad.ndev ? "-" : "None found");
@@ -325,14 +452,37 @@ static void setup_draw(struct lockinfo *lk, const BYTE *bg, int sel, int capturi
         else if (r == ROW_SPEED) { label = "Game speed"; val = g_game_speed == 1 ? "Easy (20)" : g_game_speed == 2 ? "Medium (25)" : "Hard (30)"; }
         else if (r == ROW_DEFAULTS) label = "Reset to defaults";
         else if (r == ROW_DONE) label = "Save and exit";
-        buf_text(18, y, label);
-        buf_text(128, y, val);
+        ui_text(lk, 24, y, label, sc);
+        if (*val) ui_text(lk, vx - ui_text_w(val, sc), y, val, sc);
     }
-    /* live view: steering and throttle/brake after dead zone, at the bottom right */
+    /* more rows above / below: small blue arrows at the left, as the game's arrows */
+    for (i = 0; i < 2; i++) {
+        int show = i == 0 ? top > 0 : top + VIS < ROW_COUNT, ty = i == 0 ? 55 : (int)(y0 + VIS * step + 1), d;
+        if (!show) continue;
+        for (d = 0; d < 5; d++)
+            fill_rect(lk, (int)((14 - d) * g_ui_k), (int)((ty + (i == 0 ? d : 4 - d)) * g_ui_k),
+                      (int)((15 + d) * g_ui_k), (int)((ty + (i == 0 ? d : 4 - d) + 1) * g_ui_k), 0x2040F0);
+    }
+    if (bg) {   /* the page's name in a box, as the game's pages have */
+        const char *t = "Controller Setup";
+        float bx0 = 86, bx1 = 234, by0 = 199, by1 = 234;
+        int x0 = (int)(bx0 * g_ui_k), x1 = (int)(bx1 * g_ui_k), y0b = (int)(by0 * g_ui_k), y1b = (int)(by1 * g_ui_k);
+        int t1 = max(1, (int)(g_ui_k + 0.5f));
+        if (!g_page_bg.px) {   /* the page background has its own box */
+            darken(lk, x0, y0b, x1, y1b);
+            fill_rect(lk, x0, y0b, x1, y0b + t1, 0x000000);
+            fill_rect(lk, x0, y0b, x0 + t1, y1b, 0x000000);
+            fill_rect(lk, x0, y1b - t1, x1, y1b, 0x2A5A20);
+            fill_rect(lk, x1 - t1, y0b, x1, y1b, 0x2A5A20);
+        }
+        ui_text(lk, (bx0 + bx1) / 2 - ui_text_w(t, 1) / 2.0f, by0 + 9, t, 1);
+    }
+    /* live view: steering and throttle/brake after dead zone, at the top right */
     {
+        int S = (int)(g_ui_k + 0.5f);
         float st = src_value(g_bind[ACT_RIGHT]) - src_value(g_bind[ACT_LEFT]);
         float ac = src_value(g_bind[ACT_ACCEL]), br = src_value(g_bind[ACT_BRAKE]);
-        int bx = 240 * S, by = 6 * S, bw = 60 * S, bh = 5 * S, c = bx + bw / 2;
+        int bx = (int)(244 * g_ui_k), by = (int)(10 * g_ui_k), bw = 56 * S, bh = 5 * S, c = bx + bw / 2;
         fill_rect(lk, bx, by, bx + bw, by + bh, 0x303030);
         if (st >= 0) fill_rect(lk, c, by, c + (int)(st * bw / 2), by + bh, 0xF0C020);
         else fill_rect(lk, c + (int)(st * bw / 2), by, c, by + bh, 0xF0C020);
@@ -365,7 +515,9 @@ static void pad_setup_close(void)
     free(g_ps.bg); g_ps.bg = NULL;
     pad_save_settings();
     g_pad_setup_open = 0;
-    g_pad_esc_pulse = 3;                 /* leave the game's Calibrate page as well */
+    if (g_cal_inpage) g_cal_leave = 1;   /* back to the options page once the keys are let go */
+    else g_pad_esc_pulse = 3;            /* leave the game's Calibrate page as well */
+    g_cal_inpage = 0;
     log_msg("pad: setup saved (device %s)", g_pad.active >= 0 ? g_pad.names[g_pad.active] : "none");
 }
 
@@ -427,6 +579,13 @@ static void pad_setup_frame(void)
     BYTE desc[0x6C];
     struct lockinfo lk;
     int h;
+    {   /* debug: MMCDA_OPENSETUP opens the setup screen once the menus are up */
+        static int auto_done;
+        if (!auto_done && g_font_ready && GetEnvironmentVariableA("MMCDA_OPENSETUP", NULL, 0)) {
+            auto_done = 1; g_ps.started = 0; g_pad_setup_open = 1;
+        }
+    }
+    g_vr_2d_only = g_pad_setup_open && !g_cal_inpage;
     if (!g_pad_setup_open) return;
     if (!g_ps.started) {
         memset(&g_ps, 0, sizeof g_ps);
@@ -434,6 +593,7 @@ static void pad_setup_frame(void)
         g_ps.started = 1;
     }
     pad_setup_input();
+    g_vr_2d_only = g_pad_setup_open && !g_cal_inpage;
     if (!g_pad_setup_open || !bb || !g_font_ready) return;
     vt = *(void ***)bb;
     memset(desc, 0, sizeof desc); *(DWORD *)desc = sizeof desc;
@@ -447,16 +607,27 @@ static void pad_setup_frame(void)
         g_ps.bg_pitch = lk.pitch; g_ps.bg_h = lk.h;
         if (g_ps.bg) for (h = 0; h < lk.h; h++) memcpy(g_ps.bg + (size_t)h * lk.pitch, lk.bits + h * lk.pitch, lk.pitch);
     }
-    if (g_ps.bg) setup_draw(&lk, g_ps.bg, g_ps.sel, g_ps.capturing);
+    if (g_cal_inpage) setup_draw(&lk, NULL, g_ps.sel, g_ps.capturing);
+    else if (g_ps.bg) setup_draw(&lk, g_ps.bg, g_ps.sel, g_ps.capturing);
     ((HRESULT (WINAPI *)(void *, void *))vt[32])(bb, NULL);
+}
+
+static void __cdecl calibrate_hook(void);
+static void __cdecl calibrate_page_hook(void)
+{
+    calibrate_hook();
+    g_cal_inpage = g_pad_setup_open;
 }
 
 static void __cdecl calibrate_hook(void)
 {
     if (!g_font_ready) { log_msg("pad: setup screen needs the front-end font"); return; }
     g_ps.started = 0;
+    sprite_copy(&g_page_bg, 1);
+    if (g_page_bg.w != 320 || g_page_bg.h < 240) { free(g_page_bg.px); g_page_bg.px = NULL; }
+    sprite_copy(&g_page_logo, LOADED_SPRITE[225]);
     g_pad_setup_open = 1;
-    log_msg("pad: setup screen opened");
+    log_msg("pad: setup screen opened (page background %dx%d)", g_page_bg.w, g_page_bg.h);
 }
 
 
@@ -495,6 +666,9 @@ static unsigned __cdecl joyread_hook(int n)
         if (n == 0 && g_race_active) g_joy_race_poll = GetTickCount();
         return n == 0 ? pad_joybits() : 0;      /* joystick 1 = the SDL controller */
     }
+    /* the controller was unplugged: the game still counts the Joystick 1 we offered, but
+       its DirectInput slot (0x54A1D0) is empty, and the original read would crash on it */
+    if (n < 0 || n >= 2 || !((void *volatile *)0x0054A1D0)[n]) return 0;
     return g_joyread_orig(n);
 }
 
@@ -511,6 +685,23 @@ static void install_pad(void)
             (g_joyread_orig = (PFN_JOYREAD)make_trampoline(jr_expect, 6, (BYTE *)0x004155F6)) &&
             patch_jmp((BYTE *)0x004155F0, jr_expect, 6, joyread_hook))
             log_msg("pad: the game's joystick 1 reads the SDL controller");
+    }
+    {   /* The Calibrate page (frame counter 0x5050d8) switched to a window on its first frame,
+           ran joy.cpl on its 4th, switched back (rebuilding the whole front end) and left
+           (0x5072f4 = 2). Now: no window switch, the 4th frame opens the setup screen over the
+           page as it is (icon, logo, background), and closing it leaves the page. */
+        static const BYTE f0[2] = { 0x6A, 0x01 }, f3[10] = { 0xE8, 0x66, 0x4B, 0x00, 0x00, 0xA1, 0x18, 0x5E, 0x50, 0x00 };
+        BYTE *a = (BYTE *)0x0040E8A3, *b = (BYTE *)0x0040E8C5;
+        DWORD old;
+        if (memcmp(a, f0, 2) == 0 && memcmp(b, f3, 10) == 0) {
+            VirtualProtect(a, 0x30, PAGE_EXECUTE_READWRITE, &old);
+            a[0] = 0xEB; a[1] = (BYTE)(0x40E8EA - 0x40E8A5);                      /* frame 0: nothing */
+            b[0] = 0xE8; *(INT32 *)(b + 1) = (INT32)((BYTE *)calibrate_page_hook - (b + 5));
+            b[5] = 0xEB; b[6] = (BYTE)(0x40E8EA - 0x40E8CC);                      /* skip the switch back and the exit */
+            VirtualProtect(a, 0x30, old, &old);
+            FlushInstructionCache(GetCurrentProcess(), a, 0x30);
+            log_msg("pad: Calibrate page keeps its screen");
+        }
     }
     if (memcmp((BYTE *)0x00413430, cal_expect, 6) == 0 && patch_jmp((BYTE *)0x00413430, cal_expect, 6, calibrate_hook))
         log_msg("pad: Calibrate opens the controller setup screen");

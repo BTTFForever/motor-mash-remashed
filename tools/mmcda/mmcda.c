@@ -21,6 +21,7 @@
 #include <mmsystem.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <intrin.h>
 /* public-domain Ogg Vorbis decoder (github.com/nothings/stb, v1.25) */
 #define STB_VORBIS_NO_PUSHDATA_API
 #pragma warning(push, 0)
@@ -37,6 +38,8 @@ static HANDLE g_thread, g_done;
 static volatile LONG g_generation;
 static DWORD g_volume = 0xFFFFFFFF;
 static char g_dir[MAX_PATH];    /* folder of the running exe (music lives here) */
+static volatile int g_vr_2d_only;   /* a full-screen 2D page (controller setup): no see-through black */
+static volatile int g_shot_force;   /* debug: ask the Vulkan presenter to capture this frame */
 static char g_home[MAX_PATH];   /* settings + log: MMCDA_HOME, else g_dir */
 static int g_open;
 /* size of the current game mode, and of its image on the monitor (for HUD scaling) */
@@ -54,6 +57,17 @@ static volatile int g_overview, g_cam_mode;
 static void debugmenu_poll(void);
 /* frame interpolation (interp.h) */
 static void interp_note_race(void);
+static int g_render_vulkan;
+/* race loading screen: shown from the race mode switch until the first race frame */
+static volatile int g_loading;
+static DWORD g_loading_t;
+static int g_loading_from_menu, g_loading_presents;
+/* the race intro (loading screen: track, lap record, the starter firing his gun) is shown in
+   the first race-loop frames while the game's flag 0x43F1EC is set (0x4123AC) */
+static volatile int g_in_race_loop;
+#define RACE_INTRO (g_mode_w != 320 && *(volatile int *)0x0043F1EC != 0)
+static volatile int g_loadscreen_built, g_intro_shown;   /* the intro switched from the menu layout to "Loading..." */
+static void render_menu_poll(void);   /* render.h */
 static void interp_on_viewport(void *vp);
 static void interp_on_teardown(void);
 
@@ -277,8 +291,12 @@ static volatile float g_hscale = 1.0f;
 
 static HRESULT WINAPI viewport_setplane_hook(void *vp, float l, float r, float b, float t)
 {
-    float s = g_hscale;
+    float s;
+    g_in_race_loop = 1;
+    g_loadscreen_built = 0;   /* the hold is for the next race intro only (not the way out) */
+    s = RACE_INTRO ? 1.0f : g_hscale;   /* the intro's backdrop is laid out for 4:3 */
     interp_note_race();
+
     /* first race camera frame after a mode switch: drop the frozen picture now, so
        the loading screen (2D laid out for 4:3) is never seen in widescreen */
     if (g_transition && g_trans_mode_set) {
@@ -372,12 +390,169 @@ static HRESULT WINAPI hud_blt_hook(void *dst, RECT *dr, void *src, RECT *sr, DWO
     return hr;
 }
 
+/* The same overlay blit also shows the race loading screen (track picture, lap record, the
+   starter). That one is an opaque full picture laid out for 4:3, the HUD is mostly colour key:
+   sample the overlay and treat it as a picture when most of it is opaque. */
+static int hud_is_fullscreen(void *src, const RECT *sr)
+{
+    typedef HRESULT (WINAPI *PFN_LOCK)(void *, RECT *, void *, DWORD, HANDLE);
+    typedef HRESULT (WINAPI *PFN_UNLOCK)(void *, void *);
+    typedef HRESULT (WINAPI *PFN_GETCK)(void *, DWORD, DWORD *);
+    void **vt = *(void ***)src;
+    BYTE desc[0x6C];
+    DWORD ck[2] = { 0, 0 };
+    int x, y, opaque = 0, total = 0;
+    memset(desc, 0, sizeof desc);
+    *(DWORD *)desc = sizeof desc;
+    if (((PFN_GETCK)vt[16])(src, 8 /* DDCKEY_SRCBLT */, ck) != 0) ck[0] = 0;
+    if (((PFN_LOCK)vt[25])(src, NULL, desc, 1 /* DDLOCK_WAIT */, NULL) != 0) return 0;
+    {
+        BYTE *bits = *(BYTE **)(desc + 0x24);
+        LONG pitch = *(LONG *)(desc + 0x10);
+        DWORD bpp = *(DWORD *)(desc + 0x54);
+        if (bits && (bpp == 8 || bpp == 16))
+            for (y = sr->top + 4; y < sr->bottom; y += 12)
+                for (x = sr->left + 4; x < sr->right; x += 12) {
+                    DWORD v = bpp == 8 ? bits[y * pitch + x] : ((WORD *)(bits + y * pitch))[x];
+                    total++;
+                    if (v != ck[0]) opaque++;
+                }
+    }
+    ((PFN_UNLOCK)vt[32])(src, NULL);
+    return total > 0 && opaque * 10 > total * 7;
+}
+
+/* The race loading screen is laid out for 320x200, which a CRT stretched to 4:3: the layout
+   (positions) is right stretched that way, but the pieces themselves (text lines, portrait,
+   the starter) then look taller than on the 320x240 menus. Find each piece (a group of
+   non colour-key pixels) and draw it with square pixels, centred where the stretched layout
+   puts it. Returns -1 when the overlay is not the expected 320x200 layout. */
+static int hud_intro_blit(PFN_BLT blt, void *dst, const RECT *r, void *src, const RECT *sr, DWORD fl, void *fx)
+{
+    typedef HRESULT (WINAPI *PFN_LOCK)(void *, RECT *, void *, DWORD, HANDLE);
+    typedef HRESULT (WINAPI *PFN_UNLOCK)(void *, void *);
+    typedef HRESULT (WINAPI *PFN_GETCK)(void *, DWORD, DWORD *);
+    enum { CW = 4, CH = 4, GW = 80, GH = 60, MAXB = 48 };
+    static short lab[GH][GW];
+    static int stk[GW * GH];
+    RECT box[MAXB];
+    void **vt = *(void ***)src;
+    BYTE desc[0x6C];
+    DWORD ck[2] = { 0, 0 };
+    int nb = 0, x, y, i, sh = sr->bottom - sr->top, gh = (sh + CH - 1) / CH;
+    double sx, sy;
+    /* the layout is for 200 rows, but a piece (the starter's feet) can reach below row 200 */
+    if (sr->right - sr->left != 320 || sh < 200 || sh > 240) return -1;
+    memset(desc, 0, sizeof desc);
+    *(DWORD *)desc = sizeof desc;
+    if (((PFN_GETCK)vt[16])(src, 8 /* DDCKEY_SRCBLT */, ck) != 0) ck[0] = 0;
+    if (((PFN_LOCK)vt[25])(src, NULL, desc, 1 /* DDLOCK_WAIT */, NULL) != 0) return -1;
+    {
+        BYTE *bits = *(BYTE **)(desc + 0x24);
+        LONG pitch = *(LONG *)(desc + 0x10);
+        DWORD bpp = *(DWORD *)(desc + 0x54);
+#define PX(px, py) (bpp == 8 ? (DWORD)bits[(sr->top + (py)) * pitch + sr->left + (px)] \
+                             : (DWORD)((WORD *)(bits + (sr->top + (py)) * pitch))[sr->left + (px)])
+        DWORD surf_h = *(DWORD *)(desc + 0x08);
+        if (!bits || (bpp != 8 && bpp != 16)) { ((PFN_UNLOCK)vt[32])(src, NULL); return -1; }
+        /* the blit may stop at row 200 while a piece (the starter's feet) is drawn below
+           that: look at the whole surface (up to 240 rows) */
+        if ((LONG)surf_h - sr->top > sh) {
+            sh = min((int)surf_h - (int)sr->top, 240);
+            gh = (sh + CH - 1) / CH;
+        }
+        /* occupancy per 4x4 cell (0 = empty, -1 = occupied, unlabelled) */
+        for (y = 0; y < gh; y++)
+            for (x = 0; x < GW; x++) {
+                int px, py, occ = 0;
+                for (py = y * CH; py < y * CH + CH && py < sh && !occ; py++)
+                    for (px = x * CW; px < x * CW + CW; px++)
+                        if (PX(px, py) != ck[0]) { occ = 1; break; }
+                lab[y][x] = occ ? -1 : 0;
+            }
+        /* group cells; a one-cell gap across still joins (spaces between words) */
+        for (y = 0; y < gh; y++)
+            for (x = 0; x < GW; x++) {
+                int sp = 0, id;
+                if (lab[y][x] != -1) continue;
+                if (nb == MAXB) break;
+                id = ++nb;
+                SetRect(&box[id - 1], 320, sh, 0, 0);
+                lab[y][x] = (short)id; stk[sp++] = y * GW + x;
+                while (sp) {
+                    int c = stk[--sp], cx = c % GW, cy = c / GW, dx, dy;
+                    for (dy = -1; dy <= 1; dy++)
+                        for (dx = -2; dx <= 2; dx++) {
+                            int nx = cx + dx, ny = cy + dy;
+                            if (nx < 0 || ny < 0 || nx >= GW || ny >= gh || lab[ny][nx] != -1) continue;
+                            lab[ny][nx] = (short)id; stk[sp++] = ny * GW + nx;
+                        }
+                }
+            }
+        /* exact pixel bounds of each group */
+        for (y = 0; y < sh; y++)
+            for (x = 0; x < 320; x++) {
+                int id = lab[y / CH][x / CW];
+                RECT *b;
+                if (id <= 0 || PX(x, y) == ck[0]) continue;
+                b = &box[id - 1];
+                if (x < b->left) b->left = x;
+                if (x + 1 > b->right) b->right = x + 1;
+                if (y < b->top) b->top = y;
+                if (y + 1 > b->bottom) b->bottom = y + 1;
+            }
+#undef PX
+    }
+    ((PFN_UNLOCK)vt[32])(src, NULL);
+    if (GetEnvironmentVariableA("MMCDA_INTROSHOT", NULL, 0)) {
+        static DWORD last;
+        if (GetTickCount() - last > 5000) {
+            last = GetTickCount();
+            log_msg("intro overlay: sr %ld,%ld-%ld,%ld, scan %d rows, hires %d, %d pieces", sr->left, sr->top, sr->right,
+                    sr->bottom, sh, *(volatile short *)0x006302BC, nb);
+            for (i = 0; i < nb; i++) log_msg("  piece %d: %ld,%ld-%ld,%ld", i, box[i].left, box[i].top, box[i].right, box[i].bottom);
+        }
+    }
+    sx = (r->right - r->left) / 320.0;
+    sy = (r->bottom - r->top) / 200.0;
+    for (i = 0; i < nb; i++) {
+        RECT s = box[i], d;
+        double cy, dh;
+        if (s.right <= s.left || s.bottom <= s.top || s.top >= 200) continue;   /* nothing starts below the layout */
+        cy = r->top + (s.top + s.bottom) / 2.0 * sy;
+        dh = (s.bottom - s.top) * sx;                    /* square pixels */
+        d.left = r->left + (LONG)(s.left * sx + 0.5);
+        d.right = r->left + (LONG)(s.right * sx + 0.5);
+        d.top = (LONG)(cy - dh / 2 + 0.5);
+        d.bottom = d.top + (LONG)(dh + 0.5);
+        /* a piece cut by the screen edge (the starter's feet at the bottom) stays on that edge */
+        if (s.bottom >= sh) OffsetRect(&d, 0, r->bottom - d.bottom);
+        else if (s.top <= 0) OffsetRect(&d, 0, r->top - d.top);
+        if (d.top < r->top) OffsetRect(&d, 0, r->top - d.top);
+        if (d.bottom > r->bottom) OffsetRect(&d, 0, r->bottom - d.bottom);
+        OffsetRect(&s, sr->left, sr->top);
+        blt(dst, &d, src, &s, fl, fx);
+    }
+    return 0;
+}
+
+/* widescreen: the centred 4:3 rectangle (as for the overlay below) */
+static int hud_intro_fit(RECT *r)
+{
+    LONG w = r->right - r->left, h = r->bottom - r->top;
+    if (h <= 0) return 0;
+    if (w * 10 > h * 17) { r->left += (w - h * 4 / 3) / 2; r->right = r->left + h * 4 / 3; }
+    return 1;
+}
+
 static HRESULT WINAPI hud_blt_inner(void *dst, RECT *dr, void *src, RECT *sr, DWORD fl, void *fx)
 {
     PFN_BLT blt = (PFN_BLT)(*(void ***)dst)[5];
     RECT r = *dr;
 
-    if (g_hud_edges && sr && g_disp_w > 0 && g_disp_h > 0) {
+    /* the race loading screen comes through the same overlay blit: draw it whole (centred
+       4:3, below), not split into the edge-anchored HUD columns */
+    if (g_hud_edges && sr && g_disp_w > 0 && g_disp_h > 0 && !RACE_INTRO && !hud_is_fullscreen(src, sr)) {
         LONG w = r.right - r.left, h = r.bottom - r.top;
         int sw = sr->right - sr->left, sh = sr->bottom - sr->top;
         double bx = (double)g_mode_w / g_disp_w, by = (double)g_mode_h / g_disp_h;
@@ -397,7 +572,7 @@ static HRESULT WINAPI hud_blt_inner(void *dst, RECT *dr, void *src, RECT *sr, DW
         }
     }
     LONG w = r.right - r.left, h = r.bottom - r.top;
-    int n = g_hud;
+    int n = RACE_INTRO ? 0 : g_hud;   /* the loading screen always fills the 4:3 height, as on a CRT */
     if (n > 0 && sr && g_disp_w > 0 && g_disp_h > 0) {
         /* back-buffer pixels per screen pixel, so the HUD lands on exact screen pixels */
         double bx = (double)g_mode_w / g_disp_w, by = (double)g_mode_h / g_disp_h;
@@ -409,12 +584,58 @@ static HRESULT WINAPI hud_blt_inner(void *dst, RECT *dr, void *src, RECT *sr, DW
             r.top += (h - hh) / 2;  r.bottom = r.top + hh;
         }
     }
+    if (RACE_INTRO && sr && hud_intro_fit(&r) && hud_intro_blit(blt, dst, &r, src, sr, fl, fx) == 0) return 0;
+    if (RACE_INTRO && sr && *(volatile short *)0x006302BC == 0 && sr->bottom - sr->top > 200) {
+        /* the race loading screen is laid out for a 200-line screen (320x200, which the CRT
+           stretched to 4:3): show the overlay's top 200 rows over the whole height */
+        static RECT s200;
+        s200 = *sr;
+        s200.bottom = s200.top + 200;
+        sr = &s200;
+    }
     if (n == 0 && h > 0 && w * 10 > h * 17) {    /* fit, widescreen: centred 4:3 */
         LONG hw = h * 4 / 3;
         r.left += (w - hw) / 2;
         r.right = r.left + hw;
     }
     return blt(dst, &r, src, sr, fl, fx);
+}
+
+/* 0x4075b0 clips the overlay sprites to 200 rows unless the hi-res flag 0x6302BC is set
+   (0x40765f: mov si, [0x6302BC]). The race loading screen's starter stands at the bottom
+   and his feet are below row 200: give the loading screen 240 rows, as later races get. */
+static int __cdecl overlay_rows_flag(void)
+{
+    if (GetEnvironmentVariableA("MMCDA_SPRLIST", NULL, 0)) {   /* debug: each pass's sprite list, every 10 s */
+        static DWORD last; static int passes;
+        if (GetTickCount() - last > 10000) { last = GetTickCount(); passes = 3; }
+        if (passes > 0) {
+            int i, n = *(volatile int *)0x00504FA4;
+            passes--;
+            log_msg("sprpass: %d sprites", n);
+            for (i = 0; i < n && i < 120; i++) {
+                int *e = (int *)(0x00503828 + i * 12);
+                BYTE *rec = (BYTE *)0x0048F378 + e[0] * 0x410;
+                log_msg("  slot %d at %d,%d size %dx%d", e[0], e[1], e[2], *(int *)(rec + 0x408), *(int *)(rec + 0x40C));
+            }
+        }
+    }
+    return *(volatile short *)0x006302BC != 0 || RACE_INTRO;
+}
+
+static __declspec(naked) void overlay_rows_thunk(void)
+{
+    __asm {
+        push eax
+        push ecx
+        push edx
+        call overlay_rows_flag
+        mov esi, eax            ; esi = flag (the game does neg si / sbb esi,esi next)
+        pop edx
+        pop ecx
+        pop eax
+        ret
+    }
 }
 
 static __declspec(naked) void hud_blt_thunk(void)
@@ -553,6 +774,15 @@ static void install_camera(void)
     if (memcmp(site, back_expect, 5) == 0) {
         VirtualProtect(site, 5, PAGE_EXECUTE_READWRITE, &old);
         apply_far_clip();                         /* page stays RWX for later updates */
+    }
+    site = (BYTE *)0x0040765F;
+    if (memcmp(site, "\x66\x8B\x35\xBC\x02\x63\x00", 7) == 0) {
+        VirtualProtect(site, 7, PAGE_EXECUTE_READWRITE, &old);
+        site[0] = 0xE8;
+        *(INT32 *)(site + 1) = (INT32)((BYTE *)overlay_rows_thunk - (site + 5));
+        site[5] = 0x90; site[6] = 0x90;
+        VirtualProtect(site, 7, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), site, 7);
     }
     site = (BYTE *)0x00407F25;
     if (memcmp(site, blt_expect, 5) == 0) {
@@ -769,11 +999,13 @@ static int __cdecl set_display_mode_hook(int w, int h, int bpp)
     G_I32(0x00617618) = bpp;
     G_I16(0x0062FA48) = (short)w;
     G_I16(0x0062FB08) = (short)h;
+    g_loading_from_menu = (g_mode_w == 320 && w != 320);
     G_I32(0x00617640) = 1;
     hr = ((PFN_SETMODE)(*(void ***)dd)[21])(dd, w, h, bpp);   /* IDirectDraw::SetDisplayMode */
     G_I32(0x00617640) = 0;
     G_I32(0x0062FA40) = hr;
     if (hr == 0) fit_window(w, h);
+    if (hr == 0) { g_loading = (w != 320 && g_loading_from_menu); g_loading_t = GetTickCount(); g_loading_presents = 0; }
     if (g_transition) InterlockedExchange(&g_trans_mode_set, 1);
     return hr == 0;
 }
@@ -782,8 +1014,20 @@ static int __cdecl set_display_mode_hook(int w, int h, int bpp)
  * callback). Freeze the current picture before the screen goes black. */
 typedef int (__cdecl *PFN_VOIDINT)(void);
 static PFN_VOIDINT g_teardown_orig;
+static void log_game_stack(const char *tag)
+{
+    DWORD *sp = (DWORD *)_AddressOfReturnAddress();
+    char line[600];
+    int i, n = snprintf(line, sizeof line, "%s from:", tag);
+    for (i = 0; i < 400 && n < (int)sizeof line - 12; i++)
+        if (sp[i] >= 0x401000 && sp[i] < 0x43D000) n += snprintf(line + n, sizeof line - n, " %lX", sp[i]);
+    log_msg("%s", line);
+}
+
 static int __cdecl teardown_hook(void)
 {
+    g_in_race_loop = 0;
+    if (g_render_vulkan) log_game_stack("display teardown");
     interp_on_teardown();
     if (!g_transition) {
         g_trans_mode_set = 0; g_trans_presents = 0; g_trans_start = GetTickCount();
@@ -802,12 +1046,68 @@ static void pad_setup_frame(void);     /* pad.h */
 static int __cdecl present_hook(unsigned int f)
 {
     pad_setup_frame();
+    render_menu_poll();
     vr_screen_capture();
     /* The game normally copies only the regions D3DRM drew this frame (its dirty-rect
        list) to the screen. Spots where nothing is drawn (e.g. building doorways with no
        interior) then keep whatever an older frame left there, which flickers. Bit 0
        asks for a full-screen copy every frame; costs nothing on modern GPUs. */
-    int r = g_present_orig(f | 1);
+    int r;
+    if (g_intro_shown && !RACE_INTRO) {
+        /* the race intro (track, lap record, the starter firing his gun) has just finished:
+           keep its last frame on screen for a moment before the first race frame is shown;
+           it used to flash by. [display] loadscreen = seconds (default 2.5, 0 = off). The race
+           loop's limiter only waits for 33 ms since its last frame, so nothing is skipped. */
+        static int hold_ms = -1;
+        g_intro_shown = 0;
+        if (hold_ms < 0) {
+            char path[MAX_PATH], v[16];
+            snprintf(path, sizeof path, "%smmcda.ini", g_home);
+            GetPrivateProfileStringA("display", "loadscreen", "2.5", v, sizeof v, path);
+            hold_ms = (int)(atof(v) * 1000);
+            if (hold_ms < 0 || hold_ms > 10000) hold_ms = 2500;
+        }
+        if (g_transition) ui_hide_cover();
+        log_msg("race intro: holding the last frame %d ms", hold_ms);
+        if (hold_ms > 0) Sleep(hold_ms);
+    }
+    if (GetEnvironmentVariableA("MMCDA_INPUTLOG", NULL, 0)) {   /* debug: record keys/clicks in the game window */
+        static BYTE down[256];
+        static const struct { int vk; const char *name; } keys[] = {
+            { VK_UP, "UP" }, { VK_DOWN, "DOWN" }, { VK_LEFT, "LEFT" }, { VK_RIGHT, "RIGHT" }, { VK_RETURN, "ENTER" },
+            { VK_ESCAPE, "ESC" }, { VK_SPACE, "SPACE" }, { VK_TAB, "TAB" }, { VK_LBUTTON, "LCLICK" }, { VK_RBUTTON, "RCLICK" },
+            { VK_CONTROL, "CTRL" }, { VK_SHIFT, "SHIFT" }, { VK_MENU, "ALT" } };
+        HWND gw = *(HWND *)0x006172A8;
+        int i;
+        if (GetForegroundWindow() == gw)
+            for (i = 0; i < (int)(sizeof keys / sizeof keys[0]); i++) {
+                int d = (GetAsyncKeyState(keys[i].vk) & 0x8000) != 0;
+                if (d && !down[keys[i].vk]) {
+                    POINT pt; RECT rc;
+                    GetCursorPos(&pt); ScreenToClient(gw, &pt); GetClientRect(gw, &rc);
+                    if (keys[i].vk == VK_LBUTTON || keys[i].vk == VK_RBUTTON)
+                        log_msg("input: %s at %ld,%ld of %ldx%ld", keys[i].name, pt.x, pt.y, rc.right, rc.bottom);
+                    else log_msg("input: %s", keys[i].name);
+                }
+                down[keys[i].vk] = (BYTE)d;
+            }
+    }
+    if (GetEnvironmentVariableA("MMCDA_SPRLIST", NULL, 0)) {   /* debug: the 2D sprite list, once per 10 s */
+        static DWORD last;
+        if (GetTickCount() - last > 10000) {
+            int i, n = *(volatile int *)0x00504FA4;
+            last = GetTickCount();
+            log_msg("sprlist: %d sprites", n);
+            for (i = 0; i < n && i < 200; i++) {
+                int *e = (int *)(0x00503828 + i * 12);
+                BYTE *rec = (BYTE *)0x0048F378 + e[0] * 0x410;
+                log_msg("  slot %d at %d,%d size %dx%d", e[0], e[1], e[2], *(int *)(rec + 0x408), *(int *)(rec + 0x40C));
+            }
+        }
+    }
+    if (RACE_INTRO && g_loadscreen_built && GetEnvironmentVariableA("MMCDA_INTROSHOT", NULL, 0))
+        g_shot_force = 1;   /* debug: capture every intro frame (the file ends up with the last) */
+    r = g_present_orig(f | 1);
     {   /* frame-time statistics (logged every 100 presents with MMCDA_LOG=1) */
         static LARGE_INTEGER freq, last;
         static double sum, worst, best = 1e9;
@@ -833,10 +1133,23 @@ static int __cdecl present_hook(unsigned int f)
         }
         last = now;
     }
-    /* menu modes (320 wide) release after a few frames; race modes wait for the
-       first 3D race frame (see viewport_setplane_hook) */
-    if (g_transition && g_trans_mode_set && g_mode_w == 320 &&
-        InterlockedIncrement(&g_trans_presents) >= 3) {
+    /* release once the new mode has presented a couple of frames: the freeze only hides
+       the black gap of the mode switch, so the race loading screen (the starter firing his
+       gun) plays as in the original. (It used to wait for the first 3D race frame.) */
+    if (GetEnvironmentVariableA("MMCDA_SEQ", NULL, 0)) {
+        static int fn;
+        if (g_mode_w != 320 && fn < 80)
+            log_msg("seq %d: flag43F1EC=%d raceloop=%d built=%d hscale %.2f", fn++, *(volatile int *)0x0043F1EC,
+                    g_in_race_loop, g_loadscreen_built, g_hscale);
+        if (g_mode_w == 320) fn = 0;
+    }
+    /* the race intro's loading screen was on screen (see the hold before the present) */
+    if (RACE_INTRO && g_loadscreen_built) {
+        g_intro_shown = 1;
+    }
+    if (g_mode_w == 320) { g_intro_shown = 0; g_loadscreen_built = 0; }
+    if (g_transition && g_trans_mode_set &&
+        InterlockedIncrement(&g_trans_presents) >= 2) {
         ui_hide_cover();
         log_msg("transition: released after %lu ms", GetTickCount() - g_trans_start);
     }
@@ -1012,6 +1325,8 @@ static void install_pak_hook(void)
             ? "archive-lookup hook installed" : "pak patch failed");
 }
 
+static int vr_race_intro(void) { return RACE_INTRO; }
+#include "render.h"
 #include "interp.h"
 #include "tiles.h"
 #include "debugmenu.h"
@@ -1020,9 +1335,30 @@ static void install_pak_hook(void)
 #include "sixcars.h"
 #include "car.h"
 #include "cams.h"
+#include "census.h"
 static void interp_note_race(void) { g_race_seen = 1; }
 static void interp_on_viewport(void *vp) { install_interp_vtables(vp); }
 static void interp_on_teardown(void) { tiles_release(); interp_reset(); vr_on_teardown(); }
+
+/* 0x4097C7: the race-start code rebuilds the front-end text list (0x410BE0) right before it
+   lays out the loading screen ("Loading...", track, lap record): note that it happened */
+static void __cdecl loadscreen_hook(void)
+{
+    ((void (__cdecl *)(void))0x00410BE0)();
+    g_loadscreen_built = 1;
+}
+
+static void install_loadscreen_hook(void)
+{
+    static const BYTE expect[5] = { 0xE8, 0x14, 0x74, 0x00, 0x00 };   /* call 0x410BE0 */
+    BYTE *site = (BYTE *)0x004097C7;
+    DWORD old;
+    if (memcmp(site, expect, 5) != 0) { log_msg("loading-screen site mismatch, hold disabled"); return; }
+    VirtualProtect(site, 5, PAGE_EXECUTE_READWRITE, &old);
+    *(INT32 *)(site + 1) = (INT32)((BYTE *)loadscreen_hook - (site + 5));
+    VirtualProtect(site, 5, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), site, 5);
+}
 
 static void install_hooks(void)
 {
@@ -1032,6 +1368,7 @@ static void install_hooks(void)
     static const BYTE enum_expect[8] = { 0x55, 0x8B, 0xEC, 0x8B, 0x45, 0x08, 0x8B, 0x48 };
     if ((BYTE *)GetModuleHandleA(NULL) != (BYTE *)0x400000) return;
     install_sixcars();   /* first: moves tables before other hooks copy any code */
+    install_render();
     log_msg(patch_jmp((BYTE *)0x004052C0, mode_expect, 8, set_display_mode_hook)
             ? "window-fit hook installed" : "mode site mismatch, window-fit hook skipped");
     log_msg(patch_jmp((BYTE *)0x00406A40, enum_expect, 8, enum_modes_hook)
@@ -1039,12 +1376,14 @@ static void install_hooks(void)
     install_fov_hook();
     install_camera();
     install_transition_hooks();
+    install_loadscreen_hook();
     install_interp();
     install_tiles();
     install_debugmenu();
     install_vrexport();
     install_pad();
     install_car();
+    install_census();   /* last: wraps vtables the hooks above may also patch */
 }
 
 static void install_fov_hook(void)

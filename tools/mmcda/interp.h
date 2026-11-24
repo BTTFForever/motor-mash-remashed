@@ -154,12 +154,14 @@ static void lerp_mat(MAT4 out, MAT4 a, MAT4 b, float t)
 
 /* viewport->Render(scene): capture after a logic tick, blend, render, restore */
 static void vr_capture(void);                            /* vrexport.h */
+static void (*g_census_frame)(void);                     /* census.h, game thread */
 static HRESULT WINAPI h_vp_render(void *vp, void *scene)
 {
     HRESULT hr;
     int i, n = 0;
     float alpha;
     static struct tracked *list[MAX_TRACK];
+    if (g_census_frame) g_census_frame();
     if (g_race_active && !g_in_extra) vr_capture();       /* logic done, nothing blended yet */
     if (!g_interp_on || !g_race_active) {
         overview_begin(vp);
