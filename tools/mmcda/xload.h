@@ -321,6 +321,20 @@ static void x_add_mesh(xgeo *geo, xnode *mesh, MAT m, xtexctx *tc, xnode *root)
                     v3_cross(fn, a, b); v3_norm(fn);
                     for (c = 0; c < 3; c++) memcpy(tri[c].n, fn, sizeof fn);
                 }
+                if (fabsf(tri[0].uv[0] - tri[1].uv[0]) < 1e-4f && fabsf(tri[0].uv[0] - tri[2].uv[0]) < 1e-4f &&
+                    fabsf(tri[0].uv[1] - tri[1].uv[1]) < 1e-4f && fabsf(tri[0].uv[1] - tri[2].uv[1]) < 1e-4f) {
+                    /* (within 1e-4, far below a texel: the taxi's bumper has a stray 5.7e-43) */
+                    /* one texture coordinate for the whole face: the model paints it one colour,
+                       the texel D3DRM samples there (wrapping, so v = 1.0 is the top row). Often
+                       it sits exactly on the texture's edge (the taxi's bumper uses (0, 1)), where
+                       rounding across the face flips between texels on opposite sides: a speckle.
+                       Wrap it into [0, 1) and move it a hair into its texel. */
+                    for (c = 0; c < 2; c++) {
+                        float u = tri[0].uv[c] - floorf(tri[0].uv[c]), d = (1.0f - u) * 0.5f;
+                        u += d < 1e-4f ? d : 1e-4f;
+                        tri[0].uv[c] = tri[1].uv[c] = tri[2].uv[c] = u;
+                    }
+                }
                 for (c = 0; c < 3; c++) x_push(gr, &tri[c]);
                 {   /* bounds */
                     int a2, d;
