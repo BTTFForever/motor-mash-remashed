@@ -8,6 +8,10 @@ more.
 > **You need your own copy of the game.** This project contains no game files. The installer
 > uses your own Motor Mash CD (or an image of your disc) to install and patch the game.
 
+> **Made with AI, guided by a human.** The code and documents here were written by Anthropic's
+> Claude (about 96.5% Claude Opus 5.5, 3.5% Claude Haiku 5.5). The project's author directed
+> the work, playtested it, and approved every change. Details: [AI.md](AI.md).
+
 ---
 
 ## Download and install
