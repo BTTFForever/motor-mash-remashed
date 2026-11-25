@@ -198,9 +198,11 @@ static DWORD WINAPI pad_thread(LPVOID p)
             }
         }
         if (gp) {
+            int active = 0;
             for (i = 0; i < PAD_NAXES; i++) {
                 float v = sdl.GetGamepadAxis(gp, i) / 32767.0f;
                 g_pad.axis[i] = v < -1 ? -1 : v;
+                if (g_pad.axis[i] > 0.3f || g_pad.axis[i] < -0.3f) active = 1;
             }
             for (i = 0; i < PAD_NBUTTONS; i++) {
                 /* Misc 3-6 are the 2026 Steam Controller's stick/grip touch sensors: ignored */
@@ -208,8 +210,33 @@ static DWORD WINAPI pad_thread(LPVOID p)
                 static int nlog;
                 if (b != g_pad.button[i] && nlog < 400) { nlog++; log_msg("pad: button %d (%s) %s", i, k_btn_names[i], b ? "down" : "up"); }
                 g_pad.button[i] = b;
+                if (b) active = 1;
             }
-        } else {
+            /* Steam Controller: SDL turns its keyboard/mouse "lizard mode" off only when the
+               gamepad is opened, and treats the 2026 receiver (28de:1304) as always connected.
+               A controller switched on after that, or waking from sleep, comes back in lizard
+               mode, so every press arrives twice (keys and gamepad). Re-open it, which sends
+               the settings again, on its first input since opening and after 30 s idle. */
+            if (g_pad.active >= 0 && strstr(g_pad.names[g_pad.active], "Steam Controller")) {
+                static DWORD last_input, opened_at;
+                static int seen_input;
+                static SDL_Gamepad *seen_gp;
+                if (gp != seen_gp) { seen_gp = gp; seen_input = 0; opened_at = now; }
+                if (active) {
+                    if ((!seen_input && now - opened_at > 1500) || (seen_input && now - last_input > 30000)) {
+                        SDL_JoystickID id = g_pad.ids[g_pad.active];
+                        sdl.CloseGamepad(gp);
+                        gp = seen_gp = sdl.OpenGamepad(id);
+                        opened_at = now;
+                        log_msg("pad: Steam Controller woke up: re-applied its settings (lizard mode off)%s", gp ? "" : " - re-open failed");
+                        if (!gp) g_pad.active = -1;
+                    }
+                    seen_input = 1;
+                    last_input = now;
+                }
+            }
+        }
+        if (!gp) {
             memset(g_pad.axis, 0, sizeof g_pad.axis); memset(g_pad.button, 0, sizeof g_pad.button);
         }
         InterlockedIncrement(&g_pad.seq);
@@ -642,10 +669,13 @@ static unsigned pad_joybits(void)
     float th = g_pad_steer_analog ? 0.0f : 0.5f, tt = g_pad_throttle_analog ? 0.0f : 0.5f;
     if (st > th || g_pad.button[14]) b |= 0x2000;
     if (-st > th || g_pad.button[13]) b |= 0x8000;
-    if (src_value(g_bind[ACT_ACCEL]) > tt) b |= 1;
-    if (src_value(g_bind[ACT_BRAKE]) > tt || g_pad.button[12]) b |= 0x80;
-    if (src_value(g_bind[ACT_FIRE]) > 0.5f) b |= 0x1000;
-    if (src_value(g_bind[ACT_ACTION]) > 0.5f || g_pad.button[11]) b |= 0x40;
+    /* The menus read these bits too: button 1 (accelerate) and button 2 (fire) select,
+       stick down (brake) and up (dive) move. So in menus the race bindings do nothing and
+       only A selects (with the D-pad and left stick to move); in races they work as set. */
+    if (g_race_active && src_value(g_bind[ACT_ACCEL]) > tt) b |= 1;
+    if ((g_race_active && src_value(g_bind[ACT_BRAKE]) > tt) || g_pad.button[12]) b |= 0x80;
+    if (g_race_active ? src_value(g_bind[ACT_FIRE]) > 0.5f : g_pad.button[0]) b |= 0x1000;
+    if ((g_race_active && src_value(g_bind[ACT_ACTION]) > 0.5f) || g_pad.button[11]) b |= 0x40;   /* X = dive went up */
     if (!g_race_active) {                  /* menus: the left stick moves up/down as well */
         if (g_pad.axis[1] < -0.5f) b |= 0x40;
         if (g_pad.axis[1] > 0.5f) b |= 0x80;

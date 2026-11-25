@@ -145,8 +145,20 @@ Running it again on a patched game updates the patch files and keeps your settin
   - game speed
   - track unlocking
   - reset to defaults
-- The left stick navigates the menus (up/down as well as left/right); Start pauses; B goes
-  back.
+- **Menus and races use separate controls.** Your bindings (above) apply in races only, so a
+  trigger or the dive button can't select or move things in the menus:
+
+  | | Menus | Races |
+  |---|---|---|
+  | Move | D-pad or left stick | your steering binding |
+  | Select | A | (accelerate and fire as bound) |
+  | Back | B | — |
+  | Pause / Esc | Start (☰) | Start, or your pause binding |
+  | Triggers, X, other race bindings | do nothing | as bound |
+
+  The Controller Setup screen itself uses the same menu controls.
+- If the Steam Controller is switched on after the game starts, or wakes from sleep, its
+  keyboard/mouse mode is turned off again on its first input, so presses aren't doubled.
 - Touch-sensitive sticks and grips (Steam Controller) are ignored, so a light touch doesn't
   press anything.
 - The control choice at start-up keeps the original meaning: the purple and pink lumps are the
