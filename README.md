@@ -1,9 +1,11 @@
-# Motor Mash for Windows 10/11
+# Motor Mash: ReMashed
 
-A fan patch that gets **Motor Mash** (Eutechnyx / Ocean, 1998) running properly on modern Windows,
-and adds a long list of improvements: smooth high-refresh-rate rendering, native modern
-controllers with true analog driving, new race cameras, six-car races, difficulty settings and
-more.
+*(formerly "Motor Mash for Windows 10/11")*
+
+**ReMashed** is a fan patch that gets **Motor Mash** (Eutechnyx / Ocean, 1998) running properly
+on Windows 10 and 11. It adds a long list of improvements: smooth high-refresh-rate rendering,
+native modern controllers with true analog driving, new race cameras, six-car races,
+difficulty settings and more.
 
 > **You need your own copy of the game.** This project contains no game files. The installer
 > uses your own Motor Mash CD (or an image of your disc) to install and patch the game.

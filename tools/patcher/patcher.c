@@ -1,5 +1,5 @@
 #define _CRT_SECURE_NO_WARNINGS
-/* Motor Mash Win11 patch installer.
+/* Motor Mash: ReMashed - patch installer.
  *
  * Run it in an installed Motor Mash folder (the one with MotorMsh.exe). It:
  *   1. checks MotorMsh.exe is the original release (SHA-256), keeps it as
@@ -655,8 +655,8 @@ int main(int argc, char **argv)
     const char *image = NULL, *install_to = NULL;
     char drive = 0, exe[MAX_PATH];
     int i, want_restore = 0, ok_dx, ok_music, have_disc = 0, installed = 0;
-    printf("Motor Mash for Windows 11 - installer and patch\n"
-           "================================================\n"
+    printf("Motor Mash: ReMashed - installer and patch\n"
+           "==========================================\n"
            "You need your own Motor Mash CD (or an image of it).\n\n");
     g_dir[0] = 0;
     for (i = 1; i < argc; i++) {
