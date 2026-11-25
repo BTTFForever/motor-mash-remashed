@@ -772,6 +772,14 @@ static void install_tracks(void)
 {
     DWORD old;
     int s, bad = 0, k;
+    {   /* still being finished: off unless mmcda.ini [tracks] custom=1 (or MMCDA_CUSTOMTRACKS=1) */
+        char path[MAX_PATH], v[8];
+        int on;
+        snprintf(path, sizeof path, "%smmcda.ini", g_home);
+        on = GetPrivateProfileIntA("tracks", "custom", 0, path);
+        if (GetEnvironmentVariableA("MMCDA_CUSTOMTRACKS", v, sizeof v)) on = atoi(v);
+        if (!on) { log_msg("tracks: custom tracks off ([tracks] custom=1 turns them on)"); return; }
+    }
     if (G_I32(0x00450EDC) != 0x0040A620) { log_msg("tracks: page table differs, custom tracks off"); return; }
     if (G_I32(0x00404461) != 0x00445AE8 || G_I32(0x00404A33) != TS_OBJ_RECS * TS_OBJ_REC ||
         strcmp(*(const char **)(0x00445AE8 + TS_JUKE01_REC * TS_OBJ_REC), "JUKE01") != 0) {

@@ -5,6 +5,9 @@ in MotorMsh.exe; nothing here contains game data.
 
 ## Playing a custom track
 
+Custom tracks are still being finished, so they are off by default: turn them on with
+`custom=1` under `[tracks]` in `mmcda.ini` (or the environment variable `MMCDA_CUSTOMTRACKS=1`).
+
 Save the map in `Track\` under a slot 9-16 name of its world: `AMAZON9.MAP`, then
 `AMAZONA.MAP` .. `AMAZONG.MAP` (likewise `WEST`, `ICE`, `ATLAN`, `NIGHT`, `CITY`). On the
 track select page (the parrot) it follows that world's own tracks, on a green ball labelled
