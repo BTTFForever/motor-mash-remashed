@@ -338,9 +338,52 @@ static void fog_update(void)
     ((PFN_B)vt[52])(scene, g_fog_on ? TRUE : FALSE);              /* SetSceneFogEnable */
 }
 
+/* Original renderer, widescreen: the race intro (loading screen) backdrop is a 3D scene laid
+   out for the 320x200 race display, which a CRT showed stretched to 4:3. As the Vulkan
+   renderer does (vkrender.h, vr_on_render_body), draw it in the middle 4:3 of the screen,
+   framed as 320x200: the viewport moves there (Configure) with non-uniform scaling for the
+   intro, and goes back to the whole screen on the first race frame. */
+#define VP_SETUNIFORM 17
+#define VP_CONFIGURE  22
+#define VP_GETUNIFORM 29
+static int g_vp_intro;
+static BOOL g_vp_uniform;
+static int viewport_intro(void *vp, float *l, float *r, float *b, float *t)
+{
+    typedef HRESULT (WINAPI *PFN_CONF)(void *, LONG, LONG, DWORD, DWORD);
+    typedef HRESULT (WINAPI *PFN_SETU)(void *, BOOL);
+    typedef BOOL (WINAPI *PFN_GETU)(void *);
+    void **vt = *(void ***)vp, *dev = G_DEVICE, **dvt;
+    DWORD w, h;
+    if (g_render_vulkan || !dev) return 0;
+    dvt = *(void ***)dev;
+    w = ((PFN_GETDIM)dvt[DEV_GETWIDTH])(dev);
+    h = ((PFN_GETDIM)dvt[DEV_GETHEIGHT])(dev);
+    if (RACE_INTRO && w * 3 > h * 4 + 4) {
+        DWORD w43 = h * 4 / 3;
+        float half = (*r - *l) * 0.5f * 200.0f / 320.0f;
+        if (!g_vp_intro) {
+            g_vp_uniform = ((PFN_GETU)vt[VP_GETUNIFORM])(vp);
+            ((PFN_CONF)vt[VP_CONFIGURE])(vp, (LONG)(w - w43) / 2, 0, w43, h);
+            ((PFN_SETU)vt[VP_SETUNIFORM])(vp, FALSE);
+            g_vp_intro = 1;
+            log_msg("viewport: race intro drawn in the middle 4:3 (%lu of %lu)", w43, w);
+        }
+        *b = -half; *t = half;
+        return 1;
+    }
+    if (g_vp_intro) {                                  /* the race: the whole screen again */
+        ((PFN_CONF)vt[VP_CONFIGURE])(vp, 0, 0, w, h);
+        ((PFN_SETU)vt[VP_SETUNIFORM])(vp, g_vp_uniform);
+        g_vp_intro = 0;
+    }
+    return 0;
+}
+
 static HRESULT WINAPI viewport_setplane_hook(void *vp, float l, float r, float b, float t)
 {
     float s;
+    viewport_intro(vp, &l, &r, &b, &t);
     g_in_race_loop = 1;
     if (!RACE_INTRO) fog_update();
     g_loadscreen_built = 0;   /* the hold is for the next race intro only (not the way out) */
@@ -356,16 +399,35 @@ static HRESULT WINAPI viewport_setplane_hook(void *vp, float l, float r, float b
     return g_setplane_orig(vp, l * s, r * s, b, t);
 }
 
+/* The loading screen is drawn by the race loader before the race loop sets any planes: lay
+   it out just before each Render (vtable slot 13) instead, from the viewport's own planes. */
+#define VP_RENDER   13
+#define VP_GETPLANE 27
+typedef HRESULT (WINAPI *PFN_VPRENDER)(void *vp, void *frame);
+static PFN_VPRENDER g_vprender_orig;
+static HRESULT WINAPI viewport_render_hook(void *vp, void *frame)
+{
+    typedef HRESULT (WINAPI *PFN_GETPL)(void *, float *, float *, float *, float *);
+    if (!g_render_vulkan && (RACE_INTRO || g_vp_intro)) {
+        float l, r, b, t;
+        if (((PFN_GETPL)(*(void ***)vp)[VP_GETPLANE])(vp, &l, &r, &b, &t) == 0 && viewport_intro(vp, &l, &r, &b, &t))
+            g_setplane_orig(vp, l, r, b, t);
+    }
+    return g_vprender_orig(vp, frame);
+}
+
 static void hook_viewport_vtable(void *vp)
 {
     void **vt = *(void ***)vp;
     DWORD old;
     if (g_setplane_orig || vt[VP_SETPLANE] == (void *)viewport_setplane_hook) return;
-    if (!VirtualProtect(&vt[VP_SETPLANE], sizeof(void *), PAGE_READWRITE, &old)) return;
+    if (!VirtualProtect(&vt[VP_RENDER], sizeof(void *) * (VP_SETPLANE - VP_RENDER + 1), PAGE_READWRITE, &old)) return;
+    g_vprender_orig = (PFN_VPRENDER)vt[VP_RENDER];
+    vt[VP_RENDER] = (void *)viewport_render_hook;
     g_setplane_orig = (PFN_SETPLANE)vt[VP_SETPLANE];
     vt[VP_SETPLANE] = (void *)viewport_setplane_hook;
-    VirtualProtect(&vt[VP_SETPLANE], sizeof(void *), old, &old);
-    log_msg("viewport SetPlane hook installed");
+    VirtualProtect(&vt[VP_RENDER], sizeof(void *) * (VP_SETPLANE - VP_RENDER + 1), old, &old);
+    log_msg("viewport SetPlane and Render hooks installed");
 }
 
 static HRESULT WINAPI viewport_setback_hook(void *vp, float back)
