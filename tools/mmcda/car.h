@@ -23,6 +23,7 @@ typedef void (__cdecl *PFN_DRIVE)(unsigned, unsigned, BYTE *);
 static PFN_DRIVE g_drive_orig;
 static float g_car_drop = 10.0f;
 
+static void rumble_drive(BYTE *car);   /* rumble.h */
 static int car_is_player1(BYTE *car)
 {
     int i = (int)(car - CAR_REC(0)) / 0x460;
@@ -63,6 +64,7 @@ static void __cdecl drive_hook(unsigned in, unsigned p2, BYTE *car)
         }
     }
     g_drive_orig(in, p2, car);
+    if (car_is_player1(car)) rumble_drive(car);
     if (scaled) { CAR_I(car, 0x2E0) = saved_turn; CAR_I(car, 0x3D4) = saved_power; }
     if (g_car_lean != 100 && CAR_I(car, 0x5C) == 2)             /* leaning on flat ground */
         CAR_I(car, 0x39C) = CAR_I(car, 0x39C) * g_car_lean / 100;

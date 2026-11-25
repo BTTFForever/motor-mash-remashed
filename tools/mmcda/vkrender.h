@@ -520,6 +520,14 @@ static float vr_fog(rctx *c, float z)
     f = (c->fog_e - z) / (c->fog_e - c->fog_s);
     return f < 0 ? 0 : f > 1 ? 1 : f;
 }
+/* fog for a camera-space point: by depth, or in the top-down view (looking straight down,
+   where everything is equally deep) by distance from the middle of the screen, so the
+   ground around the car is clear and it fogs towards the edges */
+static float vr_fogp(rctx *c, const float p[3])
+{
+    if (g_fog_topdown > 0) return vr_fog(c, sqrtf(p[0] * p[0] + p[1] * p[1]));
+    return vr_fog(c, p[2]);
+}
 
 static void vr_collect_lights(rctx *c, vframe *f, MAT parent)
 {
@@ -615,7 +623,7 @@ static void vr_draw_mesh(rctx *c, vmb *mb, MAT world)
                 col[2] = g->emis[2] + base[2] * acc[2];
             } else memcpy(col, base, sizeof col);
             v[i].col = vr_pack(col, 1);
-            v[i].fog = vr_fog(c, pc[2]);
+            v[i].fog = vr_fogp(c, pc);
         }
         b->count += g->nv;
     }
@@ -678,7 +686,7 @@ static void vr_draw_decal(rctx *c, vtex *t, MAT world)
         vr_clip(c, q[order[i]], v[i].p);
         v[i].uv[0] = uv[order[i]][0]; v[i].uv[1] = uv[order[i]][1];
         v[i].col = 0xFFFFFFFF;
-        v[i].fog = vr_fog(c, p[2]);
+        v[i].fog = vr_fogp(c, p);
     }
     b->count += 6;
 }

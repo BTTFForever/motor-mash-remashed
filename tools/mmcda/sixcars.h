@@ -507,10 +507,15 @@ static void six_install_ribbon_stub(void)
  * (0x40D180) indexes 4-entry roster tables by finish[0..3], so the four roster cars are
  * listed first, in their finishing order, and the extra cars after them. */
 static PFN_VOID0 g_tick_orig;
+/* The race tick clears the per-car sound requests (0x630a60) with four separate writes
+   (0x422355-67), so cars 4-5 kept theirs set for ever: their boost loop never stopped and
+   (sndfix.h) held the shared boost sound on. Clear theirs too. The tick's loop may run a
+   few steps; their bits then hold the union of those steps, which is harmless. */
 static void __cdecl tick_hook(void)
 {
-    int pend = G_I32(0x00634D18) == 1 && G_I32(0x00634D14) == 1;
+    int pend = G_I32(0x00634D18) == 1 && G_I32(0x00634D14) == 1, i;
     if (g_six_active && !g_rib_ready) { g_rib_ready = 1; six_make_ribbons(); }
+    if (g_six_active) for (i = 4; i < SIX_MAX; i++) RT_I(RT_SNDREQ, i) = 0;
     g_tick_orig();
     if (pend && g_six_active && G_I32(0x00634C20) == 0 && G_I32(0x00634D18) == -1) {
         int order[SIX_MAX], i, k = 0, n = SIX_COUNT;
@@ -525,14 +530,25 @@ static void __cdecl tick_hook(void)
     }
 }
 
+/* ---- 0x421D70 pause: stops the sounds and clears the request / playing flags of cars
+ * 0-3 only. Cars 4-5 stayed "playing", so their engines never came back after a pause. */
+static void (__cdecl *g_pausesnd_orig)(void);
+static void __cdecl pausesnd_hook(void)
+{
+    int i;
+    g_pausesnd_orig();
+    if (g_six_active) for (i = 4; i < SIX_MAX; i++) { RT_I(RT_SNDREQ, i) = 0; RT_I(RT_SNDPLAY, i) = 0; }
+}
+
 /* ---- 0x4017E0 sound load: it overwrites sample-table entry i with car i's character for
- * each car; entries 4-5 are other samples, keep them. */
+ * each car, which made cars share engine buffers; sndfix.h puts the identity back. */
 typedef int (__cdecl *PFN_INT1)(int);
 static PFN_INT1 g_sndload_orig;
+static void snd_fix_engines(void);   /* sndfix.h */
 static int __cdecl sndload_hook(int keep)
 {
     int r = g_sndload_orig(keep);
-    if (keep == 0 && SIX_COUNT > 4) { G_I32(0x005076D0) = 4; G_I32(0x005076D4) = 5; }
+    if (keep == 0) snd_fix_engines();
     return r;
 }
 
@@ -653,6 +669,11 @@ static void install_sixcars(void)
         ok += six_wrap(0x421000, pa, 7, path_hook, (void **)&g_path_orig);
         ok += six_wrap(0x4221A0, tk, 6, tick_hook, (void **)&g_tick_orig);
         ok += six_wrap(0x4017E0, sl, 8, sndload_hook, (void **)&g_sndload_orig);
+        {   /* xor eax,eax; mov dword [0x630df4],1 */
+            static const BYTE ps[12] = { 0x33, 0xC0, 0xC7, 0x05, 0xF4, 0x0D, 0x63, 0x00, 0x01, 0x00, 0x00, 0x00 };
+            if (!six_wrap(0x421D70, ps, 12, pausesnd_hook, (void **)&g_pausesnd_orig))
+                log_msg("six: pause sound reset hook not installed");
+        }
         ok += patch_jmp((BYTE *)0x41E660, rk, 6, rank_hook);
         ok += patch_jmp((BYTE *)0x422FF0, co, 5, collide_hook);
         ok += patch_jmp((BYTE *)0x4240E0, cu, 6, catchup_hook);

@@ -144,6 +144,7 @@ Running it again on a patched game updates the patch files and keeps your settin
   - ride height
   - game speed
   - track unlocking
+  - rumble strength, menu haptics, light bar, trigger effects and controller speaker (below)
   - reset to defaults
 - **Menus and races use separate controls.** Your bindings (above) apply in races only, so a
   trigger or the dive button can't select or move things in the menus:
@@ -163,6 +164,26 @@ Running it again on a patched game updates the patch files and keeps your settin
   press anything.
 - The control choice at start-up keeps the original meaning: the purple and pink lumps are the
   two keyboard layouts, and the joystick icon is the controller.
+
+### Rumble, lights and haptics
+Every feature can be switched off or turned down in Controller Setup.
+- **Rumble** for your car: crashes, explosions, hits, firing, pickups, boosts, jump landings,
+  laps (a double tick), and the ground under you (soft ticks on grass and dirt, a heavier drag in
+  mud and sand, a sharp chatter on cobblestones, a faint hiss on ice). Nearby explosions give a
+  smaller rumble. One profile is tuned to feel right on Xbox, PlayStation and Steam controllers.
+- **Menu haptics:** ticks when moving and changing settings, taps when confirming, and a buzz
+  timed to the carousels' gear sound.
+- **Light bar** (DualSense and DualShock 4): your character's car colour while racing, a white
+  pulse while boosting, flashes for hits, pickups and laps, a red strobe when you explode, green
+  in the menus (flashing with the gunman's shots), and each character's colour on the
+  character select carousel.
+- **Adaptive triggers** (DualSense): a light spring on the road, stiffer on grass, heavy in mud,
+  a buzz on cobblestones and while boosting, slack on ice and in the air.
+- **Impulse triggers** (Xbox One / Series): trigger rumble for the same surfaces. Needs the
+  controller connected by USB.
+- **Controller speaker** (2026 Steam Controller): the game's own sound files play through the
+  controller's haptic pads: your car's sounds in races, the start lights, applause, and the menu
+  sounds. Looping sounds like the boost keep going for as long as yours does.
 
 ### Better-looking cars
 - **Smooth turning:** cars rotate with the game's full 1024-step heading instead of visible
@@ -241,6 +262,12 @@ tracks=normal     ; all = every track unlocked
 [car]
 lean=100          ; body lean, percent
 lowered=1         ; 1 = cars sit on the road
+[pad]
+rumble=100        ; rumble strength, percent (0 = off)
+menu_haptics=1    ; 0 = no menu ticks
+light_bar=1       ; 0 = the game leaves the light bar alone (dim blue)
+trigger_effects=1 ; 0 = no adaptive / impulse trigger effects
+speaker=100       ; Steam Controller speaker volume, percent (0 = off)
 [hud]
 scale=4           ; HUD size (or fit)
 anchor=edges      ; edges | center
@@ -256,7 +283,10 @@ loadscreen=2.5    ; seconds the race loading screen stays after the shot
 ```
 
 Environment variables for testing: `MMCDA_LOG=1` (writes `mmcda.log`), `MMCDA_NOINTERP=1`
-(turns frame interpolation off), `MMCDA_VIEW=<0-4>` (starting camera).
+(turns frame interpolation off), `MMCDA_VIEW=<0-4>` (starting camera), `MMCDA_RUMBLELOG=1`
+(logs sound, surface and lap events for tuning feedback).
+
+If the game ever crashes, it writes the location to `crash.txt` in the game folder.
 
 ---
 

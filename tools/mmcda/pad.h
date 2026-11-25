@@ -36,6 +36,13 @@ static struct {
     void (__cdecl *Free)(void *);
     const char *(__cdecl *GetError)(void);
     char *(__cdecl *GetGamepadMapping)(SDL_Gamepad *);
+    /* optional (rumble) */
+    unsigned char (__cdecl *RumbleGamepad)(SDL_Gamepad *, unsigned short, unsigned short, unsigned);
+    unsigned char (__cdecl *RumbleGamepadTriggers)(SDL_Gamepad *, unsigned short, unsigned short, unsigned);
+    unsigned (__cdecl *GetGamepadProperties)(SDL_Gamepad *);
+    unsigned char (__cdecl *GetBooleanProperty)(unsigned, const char *, unsigned char);
+    unsigned char (__cdecl *SetGamepadLED)(SDL_Gamepad *, unsigned char, unsigned char, unsigned char);
+    unsigned char (__cdecl *SendGamepadEffect)(SDL_Gamepad *, const void *, int);
 } sdl;
 
 static int pad_load_sdl(void)
@@ -54,6 +61,12 @@ static int pad_load_sdl(void)
     SDLF(FlushEvents, "SDL_FlushEvents") SDLF(Free, "SDL_free") SDLF(GetError, "SDL_GetError")
     SDLF(GetGamepadMapping, "SDL_GetGamepadMapping")
 #undef SDLF
+    *(FARPROC *)&sdl.RumbleGamepad = GetProcAddress(sdl.dll, "SDL_RumbleGamepad");
+    *(FARPROC *)&sdl.RumbleGamepadTriggers = GetProcAddress(sdl.dll, "SDL_RumbleGamepadTriggers");
+    *(FARPROC *)&sdl.GetGamepadProperties = GetProcAddress(sdl.dll, "SDL_GetGamepadProperties");
+    *(FARPROC *)&sdl.GetBooleanProperty = GetProcAddress(sdl.dll, "SDL_GetBooleanProperty");
+    *(FARPROC *)&sdl.SetGamepadLED = GetProcAddress(sdl.dll, "SDL_SetGamepadLED");
+    *(FARPROC *)&sdl.SendGamepadEffect = GetProcAddress(sdl.dll, "SDL_SendGamepadEffect");
     return 1;
 }
 
@@ -91,6 +104,83 @@ static float g_an_steer, g_an_accel, g_an_brake;
 static volatile int g_an_steer_on, g_an_throttle_on;
 static int g_car_lean = 100;                 /* percent of the original body lean (car.h) */
 static int g_car_lowered = 1;                /* ride height: lowered onto the road (car.h) */
+
+/* ---- rumble: the game thread asks (rumble.h), the pad thread plays it --------------- */
+static int g_pad_rumble = 100;               /* strength percent, 0 = off */
+static int g_pad_menuhap = 1;                /* menu ticks, taps and carousel buzz */
+static int g_pad_light = 1;                  /* light bar colours and flashes (PlayStation pads) */
+static int g_pad_trig = 1;                   /* adaptive (DualSense) / impulse (Xbox) trigger effects */
+static volatile LONG g_rum_seq;
+static volatile float g_rum_lo, g_rum_hi;    /* 0..1 low / high frequency motor */
+static volatile DWORD g_rum_ms;
+/* ---- light bar (DualSense / DualShock 4): the game thread sets these (rumble.h), the pad
+   thread works out the colour and sends it when it changes ------------------------------ */
+#define LED_MENU 0x10A010u                   /* green, like the main menu */
+static volatile DWORD g_led_base = LED_MENU; /* your car's colour while racing */
+/* each character's car colour (light bar), picked from the car textures */
+static const DWORD k_char_led[12] = {
+    0xD060FF, 0xA05010, 0xFFFFFF, 0xFFB000, 0x0000A0, 0xFF0000,   /* hot rod, monster truck, shuttle, buggy, sub, red truck */
+    0x006008, 0x00C0FF, 0xFF3828, 0x60FF40, 0xFFC000, 0x300060 }; /* tank, shark, van, hippie bus, taxi, black cab */
+static volatile int g_led_pulse;             /* boost: pulse towards white */
+static volatile DWORD g_led_flash, g_led_flash_end, g_led_flash_ms;
+static volatile DWORD g_led_strobe, g_led_strobe_end;   /* colour / black, fast, until then */
+static void pad_flash(DWORD rgb, DWORD ms)
+{
+    g_led_flash = rgb; g_led_flash_ms = ms; g_led_flash_end = GetTickCount() + ms;
+}
+static DWORD led_mix(DWORD a, DWORD b, float k)
+{
+    int i; DWORD r = 0;
+    if (k <= 0) return a;
+    if (k >= 1) return b;
+    for (i = 0; i < 24; i += 8) {
+        float x = ((a >> i) & 255) + ((((b >> i) & 255)) - (float)((a >> i) & 255)) * k;
+        r |= (DWORD)(x + 0.5f) << i;
+    }
+    return r;
+}
+/* ---- DualSense adaptive triggers: the game thread picks an effect per trigger (rumble.h),
+   the pad thread sends it when it changes. Effect bytes (the controller's simple modes):
+   { 0x05 } off, { 0x01, start, force } resistance from a trigger position,
+   { 0x06, frequency, strength, start } vibration. ----------------------------------------- */
+enum { TRIG_R, TRIG_L };
+static int g_pad_trig_rumble;                 /* the open pad has trigger motors (Xbox One / Series) */
+static BYTE g_trig[2][11];
+static volatile LONG g_trig_seq;
+static void pad_trigger(int side, BYTE mode, BYTE a, BYTE b, BYTE c)
+{
+    BYTE e[11] = { 0 };
+    e[0] = mode; e[1] = a; e[2] = b; e[3] = c;
+    if (memcmp(g_trig[side], e, 11)) { memcpy(g_trig[side], e, 11); InterlockedIncrement(&g_trig_seq); }
+}
+/* which trigger a binding uses: TRIG_R, TRIG_L or -1 */
+static int trig_of(int src) { return src == SRC_AXIS(5, 0) ? TRIG_R : src == SRC_AXIS(4, 0) ? TRIG_L : -1; }
+static volatile DWORD g_rum_test;           /* setup screen: tick count of a left-then-right test */
+/* one delayed rumble (the second part of a two-part effect), played by the pad thread */
+static volatile DWORD g_rum_at;
+static volatile float g_rum_at_lo, g_rum_at_hi;
+static volatile DWORD g_rum_at_ms;
+static void pad_rumble_at(DWORD delay, float lo, float hi, DWORD ms)
+{
+    g_rum_at_lo = lo; g_rum_at_hi = hi; g_rum_at_ms = ms;
+    g_rum_at = GetTickCount() + delay;
+    if (!g_rum_at) g_rum_at = 1;
+}
+static volatile DWORD g_rum_at2;               /* a second delayed slot (two-part effects) */
+static volatile float g_rum_at2_lo, g_rum_at2_hi;
+static volatile DWORD g_rum_at2_ms;
+static void pad_rumble_at2(DWORD delay, float lo, float hi, DWORD ms)
+{
+    g_rum_at2_lo = lo; g_rum_at2_hi = hi; g_rum_at2_ms = ms;
+    g_rum_at2 = GetTickCount() + delay;
+    if (!g_rum_at2) g_rum_at2 = 1;
+}
+static void pad_rumble(float lo, float hi, DWORD ms)
+{
+    if (g_pad_rumble <= 0 || g_pad.active < 0) return;
+    g_rum_lo = lo; g_rum_hi = hi; g_rum_ms = ms;
+    InterlockedIncrement(&g_rum_seq);
+}
 
 static const char *const k_btn_names[PAD_NBUTTONS] = {
     "A", "B", "X", "Y", "Back", "Guide", "Start", "L stick", "R stick", "LB", "RB",
@@ -133,6 +223,13 @@ static void pad_load_settings(void)
     GetPrivateProfileStringA("pad", "throttle", "analog", v, sizeof v, path);
     g_pad_throttle_analog = lstrcmpiA(v, "analog") == 0;
     for (a = 0; a < ACT_COUNT; a++) g_bind[a] = GetPrivateProfileIntA("pad", k_act_keys[a], k_bind_default[a], path);
+    g_pad_rumble = GetPrivateProfileIntA("pad", "rumble", 100, path);
+    g_pad_menuhap = GetPrivateProfileIntA("pad", "menu_haptics", 1, path) != 0;
+    g_pad_light = GetPrivateProfileIntA("pad", "light_bar", 1, path) != 0;
+    g_pad_trig = GetPrivateProfileIntA("pad", "trigger_effects", 1, path) != 0;
+    g_sc_speaker = GetPrivateProfileIntA("pad", "speaker", 100, path);
+    if (g_sc_speaker < 0 || g_sc_speaker > 100) g_sc_speaker = 100;
+    if (g_pad_rumble < 0 || g_pad_rumble > 100) g_pad_rumble = 100;
 }
 
 static void car_save_settings(void);   /* car.h */
@@ -147,6 +244,11 @@ static void pad_save_settings(void)
     WritePrivateProfileStringA("pad", "steering", g_pad_steer_analog ? "analog" : "digital", path);
     WritePrivateProfileStringA("pad", "throttle", g_pad_throttle_analog ? "analog" : "digital", path);
     for (a = 0; a < ACT_COUNT; a++) { snprintf(v, sizeof v, "%d", g_bind[a]); WritePrivateProfileStringA("pad", k_act_keys[a], v, path); }
+    snprintf(v, sizeof v, "%d", g_pad_rumble); WritePrivateProfileStringA("pad", "rumble", v, path);
+    WritePrivateProfileStringA("pad", "menu_haptics", g_pad_menuhap ? "1" : "0", path);
+    WritePrivateProfileStringA("pad", "light_bar", g_pad_light ? "1" : "0", path);
+    WritePrivateProfileStringA("pad", "trigger_effects", g_pad_trig ? "1" : "0", path);
+    snprintf(v, sizeof v, "%d", g_sc_speaker); WritePrivateProfileStringA("pad", "speaker", v, path);
 }
 
 /* ---- pad thread ---------------------------------------------------------------------- */
@@ -159,6 +261,10 @@ static DWORD WINAPI pad_thread(LPVOID p)
     if (!pad_load_sdl()) return 0;
     sdl.SetHint("SDL_JOYSTICK_HIDAPI_STEAM", "1");                 /* Steam Controller w/o Steam */
     sdl.SetHint("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1");
+    /* Xbox One / Series impulse triggers: XInput can't reach them; Windows.Gaming.Input can */
+    sdl.SetHint("SDL_JOYSTICK_WGI", "1");
+    sdl.SetHint("SDL_JOYSTICK_RAWINPUT", "0");      /* these two would otherwise claim the pad first */
+    sdl.SetHint("SDL_XINPUT_ENABLED", "0");
     if (!sdl.Init(SDL_INIT_GAMEPAD)) { log_msg("pad: SDL_Init failed: %s", sdl.GetError()); return 0; }
     log_msg("pad: SDL3 ready");
     for (;;) {
@@ -194,6 +300,13 @@ static DWORD WINAPI pad_thread(LPVOID p)
                     char *mp = sdl.GetGamepadMapping(gp);
                     log_msg("pad: using %s", g_pad.names[pick]);
                     if (mp) { log_msg("pad: mapping %s", mp); sdl.Free(mp); }
+                    if (sdl.GetGamepadProperties && sdl.GetBooleanProperty) {
+                        unsigned pr = sdl.GetGamepadProperties(gp);
+                        g_pad_trig_rumble = sdl.GetBooleanProperty(pr, "SDL.joystick.cap.trigger_rumble", 0);
+                        log_msg("pad: rumble %s, trigger rumble %s",
+                                sdl.GetBooleanProperty(pr, "SDL.joystick.cap.rumble", 0) ? "yes" : "no",
+                                g_pad_trig_rumble ? "yes" : "no");
+                    }
                 }
             }
         }
@@ -233,6 +346,177 @@ static DWORD WINAPI pad_thread(LPVOID p)
                     }
                     seen_input = 1;
                     last_input = now;
+                }
+            }
+        }
+        {   /* MMCDA_PCMTEST=<file in Audio>: play that game sound through the Steam Controller */
+            static int done;
+            char v[64], path[MAX_PATH];
+            if (!done && gp && g_pad.active >= 0 && strstr(g_pad.names[g_pad.active], "Steam Controller") &&
+                GetEnvironmentVariableA("MMCDA_PCMTEST", v, sizeof v) && sc_open()) {
+                short *pcm; int n = 0;
+                done = 1;
+                snprintf(path, sizeof path, "%sAudio\\%s", g_dir, v);
+                if ((pcm = sc_load_wav(path, &n))) {
+                    log_msg("steamhap: playing %s (%d samples at 8 kHz) on the pads", v, n);
+                    Sleep(2000);
+                    sc_pcm_mode(1);
+                    sc_play_pcm(pcm, n, 1.5f);
+                    sc_play_pcm(pcm, n, 1.5f);
+                    sc_pcm_mode(0);
+                    free(pcm);
+                    log_msg("steamhap: done");
+                } else log_msg("steamhap: can't read %s", path);
+            }
+        }
+        if (gp && sdl.SendGamepadEffect && g_pad.active >= 0 && strstr(g_pad.names[g_pad.active], "Steam Controller") &&
+            GetEnvironmentVariableA("MMCDA_HAPTICTEST", NULL, 0)) {
+            /* probe the Steam Controller (2026) trackpad haptics: one step a second, from 3 s
+               after the pad opens. Output reports: 0x81 pulse, 0x82 command, 0x83 LFO tone,
+               0x84 log sweep, 0x85 script (SDL main, SDL_hidapi_steam_triton.c) */
+            /* MMCDA_HAPTICTEST=1 plays all 12; a list like "0,1" plays those steps three times */
+            static DWORD t0; static SDL_Gamepad *tgp; static int idx, nseq, seq[64];
+            if (gp != tgp) {
+                char v[128], *c;
+                tgp = gp; t0 = now + 3000; idx = 0; nseq = 0;
+                GetEnvironmentVariableA("MMCDA_HAPTICTEST", v, sizeof v);
+                if (!strchr(v, ',') && atoi(v) <= 1) { for (nseq = 0; nseq < 12; nseq++) seq[nseq] = nseq; }
+                else {
+                    int r;
+                    for (r = 0; r < 3; r++)
+                        for (c = v; *c && nseq < 64; ) { seq[nseq++] = atoi(c) % 16; while (*c && *c != ',') c++; if (*c) c++; }
+                }
+            }
+            if (idx < nseq && (int)(now - t0) >= idx * 1200) {
+                BYTE b[10] = { 0 }; int n = 0, ok, step = seq[idx]; const char *what = "";
+                switch (step) {
+                case 0: b[0] = 0x82; b[1] = 3; b[2] = 2; b[3] = 0; n = 4; what = "command: click, both pads"; break;
+                case 1: b[0] = 0x82; b[1] = 3; b[2] = 1; b[3] = 0; n = 4; what = "command: tick, both pads"; break;
+                case 2: b[0] = 0x83; b[1] = 2; b[2] = 0; *(WORD *)(b + 3) = 440; *(WORD *)(b + 5) = 400; n = 10; what = "LFO tone 440 Hz 400 ms, right pad"; break;
+                case 3: b[0] = 0x83; b[1] = 1; b[2] = 0; *(WORD *)(b + 3) = 660; *(WORD *)(b + 5) = 400; n = 10; what = "LFO tone 660 Hz 400 ms, left pad"; break;
+                case 4: b[0] = 0x84; b[1] = 3; b[2] = 0; *(WORD *)(b + 3) = 600; *(WORD *)(b + 5) = 200; *(WORD *)(b + 7) = 2000; n = 9; what = "log sweep 200 -> 2000 Hz, 600 ms"; break;
+                case 5: b[0] = 0x81; b[1] = 3; *(WORD *)(b + 2) = 2000; *(WORD *)(b + 4) = 2000; *(WORD *)(b + 6) = 100; n = 8; what = "pulse 2 ms on / 2 ms off x100 (250 Hz buzz)"; break;
+                case 12: b[0] = 0x82; b[1] = 3; b[2] = 2; b[3] = 12; n = 4; what = "command: click +12 dB"; break;
+                case 13: b[0] = 0x82; b[1] = 3; b[2] = 1; b[3] = 12; n = 4; what = "command: tick +12 dB"; break;
+                case 14: b[0] = 0x82; b[1] = 3; b[2] = 4; b[3] = 6; n = 4; what = "command: rumble +6 dB"; break;
+                case 15: b[0] = 0x82; b[1] = 3; b[2] = 5; b[3] = 6; n = 4; what = "command: noise +6 dB"; break;
+                default: b[0] = 0x85; b[1] = 3; b[2] = (BYTE)(step - 6); b[3] = 0; n = 4; what = "script"; break;
+                }
+                ok = sc_haptic(b, n);
+                log_msg("pad: haptic test %d: %s%s%s -> %s%s", step, what, step >= 6 && step < 12 ? " " : "",
+                        step >= 6 && step < 12 ? (char[]){ (char)('0' + step - 6), 0 } : "", ok ? "sent" : "failed", "");
+                idx++;
+            }
+        }
+        if (g_rum_at && (int)(now - g_rum_at) >= 0) { g_rum_at = 0; pad_rumble(g_rum_at_lo, g_rum_at_hi, g_rum_at_ms); }
+        if (g_rum_at2 && (int)(now - g_rum_at2) >= 0) { g_rum_at2 = 0; pad_rumble(g_rum_at2_lo, g_rum_at2_hi, g_rum_at2_ms); }
+        if (g_rum_test) {                /* setup screen test: heavy (left) side, then light (right) */
+            DWORD t = now - g_rum_test;
+            static int step;
+            if (t < 300 && step == 0) { step = 1; pad_rumble(0.7f, 0, 300); }
+            else if (t >= 600 && step == 1) { step = 2; pad_rumble(0, 0.7f, 300); }
+            else if (t >= 900) { step = 0; g_rum_test = 0; }
+        }
+        if (gp && sdl.SendGamepadEffect && g_pad.active >= 0 && strstr(g_pad.names[g_pad.active], "DualSense")) {
+            /* adaptive triggers: off outside races (also on the pause screen) */
+            static LONG sent_seq = -1;
+            static SDL_Gamepad *sent_gp;
+            static int was_racing;
+            int racing = g_race_active && !*(volatile int *)0x00630ED4 && g_pad_rumble > 0 && g_pad_trig;
+            if (racing != was_racing || gp != sent_gp || (racing && g_trig_seq != sent_seq)) {
+                BYTE fx[47] = { 0 };        /* DS5 effects state (SDL's DS5EffectsState_t) */
+                fx[0] = 0x04 | 0x08;        /* right + left trigger effects present */
+                if (racing) { memcpy(fx + 10, g_trig[TRIG_R], 11); memcpy(fx + 21, g_trig[TRIG_L], 11); }
+                else { fx[10] = 0x05; fx[21] = 0x05; }
+                if (!sdl.SendGamepadEffect(gp, fx, sizeof fx)) {
+                    static int nfail;
+                    if (nfail++ < 3) log_msg("pad: trigger effect failed: %s", sdl.GetError());
+                }
+                sent_seq = g_trig_seq; sent_gp = gp; was_racing = racing;
+            }
+        }
+        if (gp && sdl.RumbleGamepadTriggers && g_pad_trig_rumble) {
+            /* Xbox impulse triggers: the DualSense effects (g_trig) as trigger motor levels,
+               resent every 60 ms. Resistance = a steady level by its force; vibration = pulses
+               at its frequency by its strength; off = still. */
+            static DWORD next;
+            static int phase, was_on;
+            int racing = g_race_active && !*(volatile int *)0x00630ED4 && g_pad_rumble > 0 && g_pad_trig;
+            if ((int)(now - next) >= 0 && (racing || was_on)) {
+                float lv[2] = { 0, 0 }, sc = g_pad_rumble / 100.0f;
+                int k;
+                next = now + 60;
+                phase ^= 1;                  /* vibration: on / off every update (a pulse per 120 ms) */
+                for (k = 0; racing && k < 2; k++) {
+                    const BYTE *e = g_trig[k];
+                    if (e[0] == 0x01) lv[k] = e[2] < 40 ? 0.0f : e[2] / 255.0f * 0.45f;   /* road (light): still */
+                    else if (e[0] == 0x06) lv[k] = phase ? e[2] / 255.0f * 0.7f : 0.0f;
+                }
+                sdl.RumbleGamepadTriggers(gp, (unsigned short)(lv[TRIG_L] * sc * 65535),
+                                          (unsigned short)(lv[TRIG_R] * sc * 65535), 100);
+                was_on = racing;
+            }
+        }
+        if (gp && sdl.SetGamepadLED) {   /* light bar */
+            static DWORD sent = 0xFFFFFFFF, sent_at;
+            static SDL_Gamepad *sent_gp;
+            DWORD c = g_race_active ? g_led_base : LED_MENU;
+            if (!g_race_active && *(volatile int *)0x005072F4 == 9) {   /* character select (page 9) */
+                static int last_ch = -1;
+                int ch = *(volatile int *)0x0043F22C;                     /* player 1's highlighted one */
+                if (ch >= 0 && ch < 12) c = k_char_led[ch];
+                if (last_ch >= 0 && ch != last_ch && g_pad_menuhap) pad_rumble(0.12f, 0.30f, 70);   /* carousel turned */
+                last_ch = ch;
+            }
+            if (g_race_active && g_led_pulse)
+                c = led_mix(c, 0xFFFFFF, 0.25f + 0.25f * (float)sin(now * 0.0251));     /* 4 pulses a second */
+            if ((int)(g_led_flash_end - now) > 0 && g_led_flash_ms) {               /* menus too */
+                float k = (float)(g_led_flash_end - now) / g_led_flash_ms * 1.5f;     /* hold, then fade */
+                c = led_mix(c, g_led_flash, k);
+            }
+            if (g_race_active && (int)(g_led_strobe_end - now) > 0)
+                c = (now / 70) & 1 ? g_led_strobe : 0;                                 /* explosion */
+            if (!g_pad_light) c = 0x000030;      /* setting off: a plain dim blue, no game colours */
+            if (gp != sent_gp || (c != sent && now - sent_at >= 16) || now - sent_at > 2000) {
+                {
+                    int ok = sdl.SetGamepadLED(gp, (unsigned char)(c >> 16), (unsigned char)(c >> 8), (unsigned char)c);
+                    static int nlog;
+                    if (c != sent && nlog < 300 && GetEnvironmentVariableA("MMCDA_RUMBLELOG", NULL, 0)) {
+                        nlog++; log_msg("pad: light bar %06lX%s%s", c, ok ? "" : " failed: ", ok ? "" : sdl.GetError());
+                    }
+                }
+                sent = c; sent_at = now; sent_gp = gp;
+            }
+        }
+        if (gp && sdl.RumbleGamepad) {   /* play the newest rumble request, merged with one still running */
+            static LONG seen;
+            static DWORD end;
+            static float cur_lo, cur_hi;
+            LONG seq = g_rum_seq;
+            if (seq != seen) {
+                float lo = g_rum_lo, hi = g_rum_hi, s = g_pad_rumble / 100.0f;
+                DWORD ms = g_rum_ms;
+                seen = seq;
+                /* a stronger rumble still playing keeps going until its own end and a weaker
+                   request meanwhile is dropped. (Merging used to keep the combined level as
+                   the new current one, so a stream of short overlapping pulses, like the ice
+                   hiss, carried a lap tick or crash on for seconds.) */
+                int skip = (int)(end - now) > 0 && cur_lo + cur_hi > lo + hi;
+                if (!skip) { cur_lo = lo; cur_hi = hi; end = now + ms; }
+                /* one profile for every controller, a middle ground found on a Steam
+                   Controller, an Xbox Series pad and a DualSense: the light (right) side is
+                   lifted and never under 75% of the heavy side (the DualSense's right side is
+                   weak, so events felt left-only there), and everything gets a modest lift */
+                if (!g_rum_test) {           /* the setup screen's left / right test stays raw */
+                    hi *= 1.6f;
+                    if (lo >= 0.1f && hi < lo * 0.75f) hi = lo * 0.75f;   /* events, not faint ground ticks */
+                    lo *= 1.15f; hi *= 1.15f;
+                }
+                if (lo > 1) lo = 1;
+                if (hi > 1) hi = 1;
+                if (!skip && !sdl.RumbleGamepad(gp, (unsigned short)(lo * s * 65535), (unsigned short)(hi * s * 65535), ms)) {
+                    static int nfail;
+                    if (nfail++ < 3) log_msg("pad: rumble failed: %s", sdl.GetError());
                 }
             }
         }
@@ -306,7 +590,7 @@ static int pad_inject(void)
 }
 
 /* ---- controller setup screen (replaces 0x413430, the joy.cpl launcher) --------------- */
-enum { ROW_DEVICE, ROW_BIND0, ROW_DEADZONE = ROW_BIND0 + ACT_COUNT, ROW_STEER, ROW_THROTTLE, ROW_LEAN, ROW_RIDE, ROW_SPEED, ROW_TRACKS, ROW_DEFAULTS, ROW_DONE, ROW_COUNT };
+enum { ROW_DEVICE, ROW_BIND0, ROW_DEADZONE = ROW_BIND0 + ACT_COUNT, ROW_STEER, ROW_THROTTLE, ROW_RUMBLE, ROW_MENUHAP, ROW_LIGHT, ROW_TRIG, ROW_SPEAKER, ROW_LEAN, ROW_RIDE, ROW_SPEED, ROW_TRACKS, ROW_DEFAULTS, ROW_DONE, ROW_COUNT };
 
 static void fill_rect(struct lockinfo *lk, int x0, int y0, int x1, int y1, DWORD rgb)
 {
@@ -473,6 +757,11 @@ static void setup_draw(struct lockinfo *lk, const BYTE *bg, int sel, int capturi
         } else if (r == ROW_DEADZONE) { label = "Dead zone"; snprintf(v, sizeof v, "%d%%", g_pad_deadzone); val = v; }
         else if (r == ROW_STEER) { label = "Steering"; val = g_pad_steer_analog ? "Analog" : "Digital"; }
         else if (r == ROW_THROTTLE) { label = "Throttle"; val = g_pad_throttle_analog ? "Analog" : "Digital"; }
+        else if (r == ROW_RUMBLE) { label = "Rumble"; if (g_pad_rumble) { snprintf(v, sizeof v, "%d%%", g_pad_rumble); val = v; } else val = "Off"; }
+        else if (r == ROW_MENUHAP) { label = "Menu haptics"; val = g_pad_menuhap ? "On" : "Off"; }
+        else if (r == ROW_LIGHT) { label = "Light bar"; val = g_pad_light ? "On" : "Off"; }
+        else if (r == ROW_TRIG) { label = "Trigger effects"; val = g_pad_trig ? "On" : "Off"; }
+        else if (r == ROW_SPEAKER) { label = "Controller speaker"; if (g_sc_speaker) { snprintf(v, sizeof v, "%d%%", g_sc_speaker); val = v; } else val = "Off"; }
         else if (r == ROW_LEAN) { label = "Body lean"; snprintf(v, sizeof v, "%d%%", g_car_lean); val = v; }
         else if (r == ROW_RIDE) { label = "Ride height"; val = g_car_lowered ? "Lowered" : "Original"; }
         else if (r == ROW_TRACKS) { label = "Tracks"; val = g_unlock_all ? "All unlocked" : "Normal (earn them)"; }
@@ -574,6 +863,11 @@ static void pad_setup_input(void)
             if (sel == ROW_DEADZONE) g_pad_deadzone = max(0, min(60, g_pad_deadzone + 5 * d));
             if (sel == ROW_STEER) g_pad_steer_analog = !g_pad_steer_analog;
             if (sel == ROW_THROTTLE) g_pad_throttle_analog = !g_pad_throttle_analog;
+            if (sel == ROW_RUMBLE) { g_pad_rumble = max(0, min(100, g_pad_rumble + 25 * d)); g_rum_test = GetTickCount(); }
+            if (sel == ROW_MENUHAP) g_pad_menuhap = !g_pad_menuhap;
+            if (sel == ROW_LIGHT) g_pad_light = !g_pad_light;
+            if (sel == ROW_TRIG) g_pad_trig = !g_pad_trig;
+            if (sel == ROW_SPEAKER) g_sc_speaker = max(0, min(100, g_sc_speaker + 25 * d));
             if (sel == ROW_LEAN) g_car_lean = max(0, min(100, g_car_lean + 25 * d));
             if (sel == ROW_RIDE) g_car_lowered = !g_car_lowered;
             if (sel == ROW_SPEED) g_game_speed = max(1, min(3, g_game_speed + d));
@@ -587,9 +881,14 @@ static void pad_setup_input(void)
             } else if (sel == ROW_STEER) g_pad_steer_analog = !g_pad_steer_analog;
             else if (sel == ROW_THROTTLE) g_pad_throttle_analog = !g_pad_throttle_analog;
             else if (sel == ROW_RIDE) g_car_lowered = !g_car_lowered;
+            else if (sel == ROW_RUMBLE) { g_pad_rumble = g_pad_rumble >= 100 ? 0 : g_pad_rumble + 25; g_rum_test = GetTickCount(); }
+            else if (sel == ROW_MENUHAP) g_pad_menuhap = !g_pad_menuhap;
+            else if (sel == ROW_LIGHT) g_pad_light = !g_pad_light;
+            else if (sel == ROW_TRIG) g_pad_trig = !g_pad_trig;
+            else if (sel == ROW_SPEAKER) g_sc_speaker = g_sc_speaker >= 100 ? 0 : g_sc_speaker + 25;
             else if (sel == ROW_SPEED) g_game_speed = g_game_speed == 1 ? 3 : g_game_speed - 1;
             else if (sel == ROW_TRACKS) g_unlock_all = !g_unlock_all;
-            else if (sel == ROW_DEFAULTS) { memcpy(g_bind, k_bind_default, sizeof g_bind); g_pad_deadzone = 15; g_pad_steer_analog = 1; g_pad_throttle_analog = 1; g_car_lean = 100; g_car_lowered = 1; g_game_speed = 2; }
+            else if (sel == ROW_DEFAULTS) { memcpy(g_bind, k_bind_default, sizeof g_bind); g_pad_deadzone = 15; g_pad_steer_analog = 1; g_pad_throttle_analog = 1; g_car_lean = 100; g_car_lowered = 1; g_game_speed = 2; g_pad_rumble = 100; g_pad_menuhap = 1; g_pad_light = 1; g_pad_trig = 1; g_sc_speaker = 100; }
             else if (sel == ROW_DONE) { g_ps.prev = in; g_ps.sel = sel; pad_setup_close(); return; }
             else if (sel == ROW_DEVICE && g_pad.ndev > 0) g_pad_want = ((g_pad.active < 0 ? 0 : g_pad.active) + 1) % g_pad.ndev;
         }
@@ -665,6 +964,8 @@ static PFN_JOYREAD g_joyread_orig;
 static unsigned pad_joybits(void)
 {
     unsigned b = 0;
+    /* the pause screen (0x630ed4 set) is a menu: menu controls there */
+    int race = g_race_active && !*(volatile int *)0x00630ED4;
     float st = src_value(g_bind[ACT_RIGHT]) - src_value(g_bind[ACT_LEFT]);
     float th = g_pad_steer_analog ? 0.0f : 0.5f, tt = g_pad_throttle_analog ? 0.0f : 0.5f;
     if (st > th || g_pad.button[14]) b |= 0x2000;
@@ -672,11 +973,11 @@ static unsigned pad_joybits(void)
     /* The menus read these bits too: button 1 (accelerate) and button 2 (fire) select,
        stick down (brake) and up (dive) move. So in menus the race bindings do nothing and
        only A selects (with the D-pad and left stick to move); in races they work as set. */
-    if (g_race_active && src_value(g_bind[ACT_ACCEL]) > tt) b |= 1;
-    if ((g_race_active && src_value(g_bind[ACT_BRAKE]) > tt) || g_pad.button[12]) b |= 0x80;
-    if (g_race_active ? src_value(g_bind[ACT_FIRE]) > 0.5f : g_pad.button[0]) b |= 0x1000;
-    if ((g_race_active && src_value(g_bind[ACT_ACTION]) > 0.5f) || g_pad.button[11]) b |= 0x40;   /* X = dive went up */
-    if (!g_race_active) {                  /* menus: the left stick moves up/down as well */
+    if (race && src_value(g_bind[ACT_ACCEL]) > tt) b |= 1;
+    if ((race && src_value(g_bind[ACT_BRAKE]) > tt) || g_pad.button[12]) b |= 0x80;
+    if (race ? src_value(g_bind[ACT_FIRE]) > 0.5f : g_pad.button[0]) b |= 0x1000;
+    if ((race && src_value(g_bind[ACT_ACTION]) > 0.5f) || g_pad.button[11]) b |= 0x40;   /* X = dive went up */
+    if (!race) {                  /* menus: the left stick moves up/down as well */
         if (g_pad.axis[1] < -0.5f) b |= 0x40;
         if (g_pad.axis[1] > 0.5f) b |= 0x80;
     }

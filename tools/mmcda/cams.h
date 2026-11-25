@@ -69,11 +69,14 @@ static int player_pose(float *x, float *y, float *z, float *yaw)
         }
         *yaw = (float)atan2(m[0][0] * g_cv_fsign, m[0][2] * g_cv_fsign);
         if (m[0][0] * m[0][0] + m[0][2] * m[0][2] < 1e-8f) return 0;
-        /* learn which way the model faces from the motion (fast and straight enough) */
+        /* learn which way the model faces from the motion (fast and straight enough), only
+           while the car drives forward under its own power: normal driving state (+0x3f0 0)
+           and forward speed (+0x3c0 > 0). Being blown up flings the car backwards, which
+           used to flip the camera in front of the car after every respawn. */
         {
             float sp = (float)sqrt(g_cv.vx * g_cv.vx + g_cv.vz * g_cv.vz);
             float ax = m[0][0], az = m[0][2], al = (float)sqrt(ax * ax + az * az);
-            if (sp > 150.0f) {
+            if (sp > 150.0f && CAR_I(car, 0x3F0) == 0 && CAR_I(car, 0x3C0) > 200) {
                 float d = (g_cv.vx * ax + g_cv.vz * az) / (sp * al);
                 if (d > 0.8f && g_cv_fsign < 0) { g_cv_fsign = 1; log_msg("cams: car models face +x"); }
                 if (d < -0.8f && g_cv_fsign > 0) { g_cv_fsign = -1; log_msg("cams: car models face -x"); }
@@ -169,6 +172,7 @@ static int views_pose(void *cam, void *scene, float *front, float *back, float *
         g_fr_setposition(cam, (int)(INT_PTR)scene, g_cv.px - ORIGIN_X, cy + g_cv.topdown_h, g_cv.pz - ORIGIN_Z);
         g_fr_setorientation(cam, scene, 0, -1, 0, 0, 0, 1);
         *front = 4.0f; *back = g_cv.topdown_h + 1500.0f;
+        g_fog_topdown = g_cv.topdown_h;
         return 1;
     }
     case 4: {   /* TV: fixed spot ahead and to the side, track and zoom, cut when passed */
@@ -210,6 +214,7 @@ static void views_sky(void)
     static DWORD saved;
     void *scene = *(void **)0x0054AF08;
     int want = g_view != 0 && g_race_active && scene;
+    if (g_view != 3 || !g_race_active) g_fog_topdown = 0;     /* views_pose sets it for top-down */
     if (sky_scene && (sky_scene != scene || !g_race_active)) { sky_scene = NULL; g_clear_rgb = 0; }   /* race over / new race */
     if (want && !sky_scene) {
         int w = (*(volatile int *)0x00634C44 / 16) % 6;

@@ -47,6 +47,7 @@ static double now_ms_qpc(void)
     return c.QuadPart * 1000.0 / f.QuadPart;
 }
 static volatile int g_fog_on;          /* extra: distance fog in races ([render] fog), both renderers */
+static volatile float g_fog_topdown;   /* top-down camera height while that view is on, else 0 (cams.h) */
 static volatile int g_vr_filter;      /* 3D textures: 0 sharp (as the original), 1 smooth */
 static volatile int g_vr_backfaces;   /* test mode: draw back faces too (D3DRM culls them) */
 static volatile int g_vr_2d_only;   /* a full-screen 2D page (controller setup): no see-through black */
@@ -324,16 +325,21 @@ static void fog_update(void)
     int world = (*(volatile int *)0x00634C44) / 16;
     void *scene = *(void **)0x0054AF08;
     void **vt;
-    float far_ = g_zoom > 1.0f ? 1024.0f * g_zoom : 1024.0f;
+    float far_ = g_zoom > 1.0f ? 1024.0f * g_zoom : 1024.0f, lift = 0;
+    static float last_lift;
     if (!scene) return;
     if (world < 0 || world > 5) world = 4;
-    if (scene == last_scene && g_fog_on == last_on && far_ == last_far && world == last_world) return;
-    last_scene = scene; last_on = g_fog_on; last_far = far_; last_world = world;
+    /* top-down: the original renderer fogs by depth, and looking straight down from high up
+       everything is equally deep, so push the fog out by the camera height. (Vulkan fogs
+       by distance from the middle of the screen instead, vkrender.h vr_fogp.) */
+    if (g_fog_topdown > 0 && !g_render_vulkan) lift = g_fog_topdown;
+    if (scene == last_scene && g_fog_on == last_on && far_ == last_far && world == last_world && lift == last_lift) return;
+    last_scene = scene; last_on = g_fog_on; last_far = far_; last_world = world; last_lift = lift;
     vt = *(void ***)scene;
     if (g_fog_on) {
         ((PFN_C)vt[53])(scene, k_fog_colour[world]);             /* SetSceneFogColor */
         ((PFN_M)vt[54])(scene, 0);                               /* SetSceneFogMode(D3DRMFOG_LINEAR) */
-        ((PFN_P)vt[55])(scene, far_ * 0.45f, far_ * 0.95f, 1.0f); /* SetSceneFogParams(start, end, density) */
+        ((PFN_P)vt[55])(scene, lift + far_ * 0.45f, lift + far_ * 0.95f, 1.0f); /* SetSceneFogParams(start, end, density) */
     }
     ((PFN_B)vt[52])(scene, g_fog_on ? TRUE : FALSE);              /* SetSceneFogEnable */
 }
@@ -1443,10 +1449,13 @@ static void pacediag(double t_in, double t_out)
 #include "tiles.h"
 #include "debugmenu.h"
 #include "vrexport.h"
+#include "steamhap.h"
 #include "pad.h"
 #include "sixcars.h"
 #include "tracks.h"
 #include "car.h"
+#include "rumble.h"
+#include "sndfix.h"
 #include "cams.h"
 #include "census.h"
 static void interp_note_race(void) { g_race_seen = 1; }
@@ -1511,6 +1520,8 @@ static void install_hooks(void)
     MAYBE("vrexport", install_vrexport());
     MAYBE("pad", install_pad());
     MAYBE("car", install_car());
+    MAYBE("rumble", install_rumble());
+    MAYBE("sndfix", install_sndfix());
     install_census();   /* last: wraps vtables the hooks above may also patch */
 }
 
@@ -1531,6 +1542,59 @@ static void install_fov_hook(void)
     log_msg("fov hook installed");
 }
 
+/* Crash recorder: on a fault (memory access, bad instruction, divide...) write where it
+   happened to crash.txt next to mmcda.ini, before the game dies. Some crashes only happen
+   without a debugger attached and Windows did not report them, so this is the only trace.
+   First-chance: a fault the code handles itself is recorded too (at most 4 per run). */
+static void crash_where(FILE *f, DWORD a)
+{
+    HMODULE m = NULL;
+    char name[MAX_PATH] = "?", *b;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCSTR)(INT_PTR)a, &m) && m) {
+        GetModuleFileNameA(m, name, sizeof name);
+        b = strrchr(name, '\\');
+        fprintf(f, "%08lX (%s+%lX)", a, b ? b + 1 : name, a - (DWORD)(INT_PTR)m);
+    } else fprintf(f, "%08lX", a);
+}
+static LONG WINAPI crash_handler(EXCEPTION_POINTERS *ep)
+{
+    static volatile LONG n;
+    EXCEPTION_RECORD *er = ep->ExceptionRecord;
+    CONTEXT *c = ep->ContextRecord;
+    DWORD code = er->ExceptionCode, *sp;
+    char path[MAX_PATH];
+    FILE *f;
+    SYSTEMTIME t;
+    int i, k;
+    if (code < 0xC0000000u || code == 0xC0000374u || InterlockedIncrement(&n) > 4) return EXCEPTION_CONTINUE_SEARCH;
+    snprintf(path, sizeof path, "%scrash.txt", g_home);
+    if (!(f = fopen(path, "a"))) return EXCEPTION_CONTINUE_SEARCH;
+    GetLocalTime(&t);
+    fprintf(f, "\n%04d-%02d-%02d %02d:%02d:%02d pid %lu thread %lu: exception %08lX at ", t.wYear, t.wMonth, t.wDay,
+            t.wHour, t.wMinute, t.wSecond, GetCurrentProcessId(), GetCurrentThreadId(), code);
+    crash_where(f, (DWORD)(INT_PTR)er->ExceptionAddress);
+    if (code == 0xC0000005u && er->NumberParameters >= 2)
+        fprintf(f, ", %s of %08lX", er->ExceptionInformation[0] == 0 ? "read" : er->ExceptionInformation[0] == 8 ? "execute" : "write",
+                (DWORD)er->ExceptionInformation[1]);
+    fprintf(f, "\n  eax %08lX ebx %08lX ecx %08lX edx %08lX esi %08lX edi %08lX ebp %08lX esp %08lX\n  stack:",
+            c->Eax, c->Ebx, c->Ecx, c->Edx, c->Esi, c->Edi, c->Ebp, c->Esp);
+    sp = (DWORD *)(INT_PTR)c->Esp;
+    for (i = 0, k = 0; i < 256 && k < 16; i++) {      /* return addresses in code modules */
+        DWORD v;
+        HMODULE m;
+        if (IsBadReadPtr(sp + i, 4)) break;
+        v = sp[i];
+        if (v < 0x401000 || !GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                                (LPCSTR)(INT_PTR)v, &m)) continue;
+        fprintf(f, "\n    [esp+%03X] ", i * 4); crash_where(f, v); k++;
+    }
+    fprintf(f, "\n");
+    fclose(f);
+    log_msg("crash: exception %08lX recorded in crash.txt", code);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID r)
 {
     if (reason == DLL_PROCESS_ATTACH) {
@@ -1545,6 +1609,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID r)
             size_t n = strlen(g_home);
             if (g_home[n - 1] != '\\') { g_home[n] = '\\'; g_home[n + 1] = 0; }
         } else strcpy(g_home, g_dir);
+        AddVectoredExceptionHandler(1, crash_handler);
         install_hooks();
     }
     return TRUE;
