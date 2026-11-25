@@ -1,5 +1,9 @@
 # Motor Mash: ReMashed
 
+<p align="center">
+  <img src="docs/images/cover.jpg" alt="Motor Mash PC CD-ROM box art" width="300">
+</p>
+
 *(formerly "Motor Mash for Windows 10/11")*
 
 **ReMashed** is a fan patch that gets **Motor Mash** (Eutechnyx / Ocean, 1998) running properly
@@ -7,12 +11,44 @@ on Windows 10 and 11. It adds a long list of improvements: smooth high-refresh-r
 native modern controllers with true analog driving, new race cameras, six-car races,
 difficulty settings and more.
 
-> **You need your own copy of the game.** This project contains no game files. The installer
-> uses your own Motor Mash CD (or an image of your disc) to install and patch the game.
+> **You need your own copy of the game.** This project contains no game files (only the box
+> art and screenshots on this page). The installer uses your own Motor Mash CD (or an image of
+> your disc) to install and patch the game.
 
 > **Made with AI, guided by a human.** The code and documents here were written by Anthropic's
 > Claude (about 96.5% Claude Opus 5.5, 3.5% Claude Haiku 5.5). The project's author directed
 > the work, playtested it, and approved every change. Details: [AI.md](AI.md).
+
+## Screenshots
+
+Taken in ReMashed at 1920×1080 with the Vulkan renderer.
+
+<table>
+  <tr>
+    <td><img src="docs/images/six-car-grid.jpg" alt="Six cars on the starting grid in the Amazon"></td>
+    <td><img src="docs/images/west-jump.jpg" alt="The taxi jumping a broken bridge in the Wild West"></td>
+  </tr>
+  <tr>
+    <td align="center">Six-car races</td>
+    <td align="center">Widescreen at your monitor's refresh rate</td>
+  </tr>
+  <tr>
+    <td><img src="docs/images/night-city.jpg" alt="Racing through the City at night"></td>
+    <td><img src="docs/images/amazon-chase.jpg" alt="Chasing a rival through the Amazon"></td>
+  </tr>
+  <tr>
+    <td align="center">The City at night</td>
+    <td align="center">Amazon, with the optional distance fog</td>
+  </tr>
+  <tr>
+    <td><img src="docs/images/controller-setup.jpg" alt="The Controller Setup screen with a Steam Controller"></td>
+    <td><img src="docs/images/main-menu.jpg" alt="The main menu"></td>
+  </tr>
+  <tr>
+    <td align="center">Controller Setup: native modern controllers</td>
+    <td align="center">The original menus, as they were</td>
+  </tr>
+</table>
 
 ---
 
@@ -231,7 +267,8 @@ works, and a comparison with the PlayStation version.
 ## Credits and licences
 
 - **Motor Mash** © 1998 Ocean Software / Eutechnyx. This project is an unofficial fan patch and
-  includes no game content.
+  includes no game content. The box art and screenshots in `docs/images` belong to their owners
+  and are shown only to identify the game.
 - **dgVoodoo2** by Dege, shipped unmodified with this game mod as its readme allows.
 - **SDL3**, zlib licence (`tools/mmcda/third_party/SDL3/.../LICENSE.txt`).
 - **stb_vorbis** by Sean Barrett, public domain / MIT.
